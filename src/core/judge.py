@@ -5,10 +5,11 @@ from typing import Dict, Any
 @dataclass
 class JudgementConfig:
     """判定窗口配置"""
-    perfect: int = 12
-    great: int = 25
-    good: int = 50
-    bad: int = 70
+    perfect_g: int = 10
+    perfect: int = 30
+    great: int = 45
+    good: int = 60
+    bad: int = 80
     miss: int = 80
     
     score_values: Dict[str, int] = None
@@ -17,12 +18,12 @@ class JudgementConfig:
     def __post_init__(self):
         if self.score_values is None:
             self.score_values = {
-                'perfect': 300, 'great': 200, 'good': 100,
+                'perfect_g': 320, 'perfect': 300, 'great': 200, 'good': 100,
                 'bad': 50, 'miss': 0
             }
         if self.bonus_values is None:
             self.bonus_values = {
-                'perfect': 0.5, 'great': 0.25, 'good': -1,
+                'perfect_g': 0.5, 'perfect': 0.25, 'great': 0, 'good': -1,
                 'bad': -3, 'miss': -50
             }
 
@@ -33,7 +34,8 @@ class JudgeSystem:
     def get_judgement(self, time_diff: int) -> str:
         """根据时间差返回判定结果"""
         abs_diff = abs(time_diff)
-        
+        if abs_diff <= self.config.perfect:
+            return 'perfect_g'
         if abs_diff <= self.config.perfect:
             return 'perfect'
         elif abs_diff <= self.config.great:
@@ -46,20 +48,3 @@ class JudgeSystem:
             return 'miss'
         return 'miss'  # 超时
     
-    def calculate_score(self, time_diff: int, combo: int) -> Dict[str, Any]:
-        """计算单次击打分数"""
-        judgement = self.get_judgement(time_diff)
-        
-        base_score = self.config.score_values[judgement]
-        bonus = self.config.bonus_values[judgement]
-        
-        # 连击加成（示例）
-        combo_multiplier = 1.0 + (combo // 10) * 0.1
-        
-        return {
-            'judgement': judgement,
-            'base_score': base_score,
-            'bonus': bonus,
-            'combo_multiplier': combo_multiplier,
-            'score': base_score * combo_multiplier
-        }

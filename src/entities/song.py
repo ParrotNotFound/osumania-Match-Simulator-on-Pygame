@@ -2,6 +2,7 @@
 import pygame
 from dataclasses import dataclass
 from typing import List, Tuple
+import os
 
 @dataclass
 class Note:

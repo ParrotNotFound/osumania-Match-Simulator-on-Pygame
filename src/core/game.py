@@ -25,7 +25,7 @@ class OsuGame:
         self.judge_system = JudgeSystem()
         
         # 游戏状态
-        self.game_state = "MENU"  # MENU, SONG_SELECT, PLAYING, RESULTS
+        self.game_state = "SONG_SELECT"  # MENU, SONG_SELECT, PLAYING, RESULTS
         self.current_time = 0
         self.song_start_time = 0
         
@@ -107,7 +107,11 @@ class OsuGame:
             self._render_results()
         
         pygame.display.flip()
-    
+    def _render_menu(self):
+        """初始页面，暂时不用，就放着"""
+    def _render_song_select(self):
+        """选歌页面"""
+
     def _render_gameplay(self):
         """渲染游戏进行中的画面"""
         # 绘制队伍信息
