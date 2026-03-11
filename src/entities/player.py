@@ -85,7 +85,7 @@ class Player:
         note_time = Note.time
         time_diff = note_time - current_time
         judgement = judge_system.get_judgement(time_diff)
-        score_info = self.calculate_score(judge_system, time_diff, self.combo)
+        score_info = self._calculate_score(judgement, judge_system)
         try:
             self.active_notes.remove(note)
         except Exception as e:
@@ -109,14 +109,20 @@ class Player:
             'time_diff': time_diff
         }
     def _calculate_score(self,judgement,judge_system = JudgeSystem()):
-
+        self.bonus += judge_system.config.bonus_values(judgement)
+        if self.bonus > 100.0:
+            self.bonus = 100
+        elif self.bonus < 0:
+            self.bonus = 0
+        self.score += judge_system.config.score_values + self.bonus
+        self.std_score = self.score * 1000000.0 / self.max_score
         """标准化增加分数"""
     def _update_accuracy(self):
         """重新计算准确率"""
         total_hits = sum(self.judgement_counts.values())
         if total_hits > 0:
             weighted_sum = (
-                self.judgement_counts['perfect_p'] * 300 +
+                self.judgement_counts['perfect_g'] * 300 +
                 self.judgement_counts['perfect'] * 300 +
                 self.judgement_counts['great'] * 200 +
                 self.judgement_counts['good'] * 100 +
