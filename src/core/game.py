@@ -6,7 +6,7 @@ from ..entities.song import Song
 from ..entities.player import Player
 from .match import Match
 from .judge import JudgeSystem
-
+import math
 
 class OsuGame:
     def __init__(self, screen_width: int = 1280, screen_height: int = 720):
@@ -23,7 +23,7 @@ class OsuGame:
         self.max_render_dist = 1500
         
         # 游戏组件
-        self.match: Optional[Match] = None
+        self.match: Optional[Match] = Match("TEST",1)
         self.current_song: Optional[Song] = None
         self.judge_system = JudgeSystem()
         
@@ -86,6 +86,11 @@ class OsuGame:
     
     def _update(self):
         """更新游戏逻辑"""
+        if self.game_state == "SONG_SELECT":
+            self.current_time = pygame.time.get_ticks() - self.song_start_time
+            if(self.current_time > 30000):
+                self._choose_song()
+                self.song_start_time = self.current_time
         if self.game_state == "PLAYING":
             self.current_time = pygame.time.get_ticks() - self.song_start_time
             
@@ -137,16 +142,43 @@ class OsuGame:
         t_width,t_height= myfont.size(str(teams[1].name))
         textImage = myfont.render(str(teams[1].name), True, teams[1].color)
         self.screen.blit(textImage, (1270-t_width,20))
+        # 队名后为比分显示
+        progress = self.match.get_match_progress(False)
+        windata = progress["scores"]
+        wins = progress["rounds_to_win"]
+        for i in range(wins):
+            clr = [(100,100,100),(255,215,0)]
+            pygame.draw.rect(self.screen, clr[windata[0]>i], [640 + (-0.5)*600 + i*40 -25,20, 25, 25])
+            pygame.draw.rect(self.screen, clr[windata[1]>i], [640 + (0.5)*600 - i*40 ,20, 25, 25])
 
-        
     def _render_menu(self):
         """初始页面，暂时不用，就放着"""
     def _render_song_select(self):
         """选歌页面"""
-
+        self._render_team_big_points()
+        diffcolor = {'RC':(187,255,255),'SP':(255,215,0),'ST':(255,165,0),'HD':(255,0,0),'TB':(200,200,200)}
+        
+        myfont = pygame.font.Font(None,40)
+        s_width = 500
+        songs = self.match.song_pool
+        s_height = 600/len(songs)
+        chosen_songs = self.match.selected_songs
+        for s in chosen_songs:
+            color = self.match.teams[s["team"]].color
+            index = songs.index[s["song"]]
+            pygame.draw.rect(self.screen, color, [640-s_width/2, 70+s_height*index, s_width, s_height-6])
+        for i,song in enumerate(songs):
+            songskey = song.id
+            songsvalue = song.title
+            pygame.draw.rect(self.screen, (100,100,100), [640-s_width/2+5, 70+s_height*i+5, s_width-10, s_height-16])
+            textImage = myfont.render(f'{songskey}', True, diffcolor[f'{songskey[0]}{songskey[1]}'])
+            self.screen.blit(textImage, (640-s_width/2+10,80+(i)*s_height))
+            textImage = myfont.render(f'{songsvalue}', True, (255,255,255))
+            self.screen.blit(textImage, (640-s_width/2+80,80+(i)*s_height))
     def _render_gameplay(self):
         """渲染游戏进行中的画面"""
         # 绘制队伍信息
+        
         for i, team in enumerate(self.match.teams):
             # 绘制队伍分数
             font = pygame.font.Font(None, 48)
@@ -157,30 +189,75 @@ class OsuGame:
             # 绘制玩家信息
             for j, player in enumerate(team.players):
                 self._render_player(player, 50 + i * 900, 100 + j * 150)
-        
+
+        # 以下这段是显示底下那一坨分数的，老代码石山搬过来的，这段比较复杂不好动
+        score_a = self.match.teams[0].total_score
+        score_b = self.match.teams[1].total_score
+        teamColor = [self.match.teams[0].color,self.match.teams[1].color]
+        bigfont = pygame.font.Font(None,60)
+        smallfont = pygame.font.Font(None,25)
+        myfont = pygame.font.Font(None,40)
+        teamgap = math.pow(abs(score_a-score_b)*70,0.35)
+        if score_a > score_b:
+            red_winning = True
+            textImage = smallfont.render(str(int(abs(score_a-score_b))), True, (255,255,255))
+            t_width,t_height= smallfont.size(str(int(abs(score_a-score_b))))
+            self.screen.blit(textImage, (640-t_width,635))
+            t_width,t_height= bigfont.size(str(int(score_a)))
+            textImage = bigfont.render(str(int(score_a)), True, teamColor[0])
+            self.screen.blit(textImage, (640-t_width-teamgap,660))
+            textImage = myfont.render(str(int(score_b)), True, teamColor[1])
+            self.screen.blit(textImage, (640,660))
+            pygame.draw.rect(self.screen, teamColor[0], [640-teamgap, 650, teamgap, 10])
+        else:
+            red_winning = False
+            textImage = smallfont.render(str(int(abs(score_a-score_b))), True, (255,255,255))
+            t_width,t_height= smallfont.size(str(int(abs(score_a-score_b))))
+            self.screen.blit(textImage, (640,635))
+            t_width,t_height= myfont.size(str(int(score_a)))
+            textImage = bigfont.render(str(int(score_b)), True, teamColor[1])
+            self.screen.blit(textImage, (640+teamgap,660))
+            textImage = myfont.render(str(int(score_a)), True, teamColor[0])
+            self.screen.blit(textImage, (640-t_width,660))
+            pygame.draw.rect(self.screen, teamColor[1], [640, 650, teamgap, 10])
         # 绘制当前时间
         time_font = pygame.font.Font(None, 36)
         time_text = time_font.render(f"Time: {self.current_time/1000:.1f}s", 
                                     True, (255, 255, 255))
         self.screen.blit(time_text, (600, 680))
-    
+        # 最后再画大比分
+        self._render_team_big_points()
     def _render_player(self, player: Player, x, y):
         """绘制单个玩家信息"""
+        #背景板
+        pygame.draw.rect(self.screen, (0,0,0), [x, y,360, 480])
+        #键
+        for note in player.active_notes:
+            rect_width = 35
+            rect_height = 10
+            rect_x = x+50+int(note.x)*0.3
+            rect_y = y+260-(int(note.time)-self.current_time)*0.6
+            pygame.draw.rect(self.screen, (255,255,255), [rect_x, rect_y, rect_width, rect_height])
+        # 挡板
+        pygame.draw.rect(self.screen, (0,0,0), [x, y-460,480, 480])
+        pygame.draw.rect(self.screen, (50,50,50), [x+50+19.2, y+260, 150, 20])
+        # 分数和准确率
+        info_font = pygame.font.Font(None, 40)
+        color = self.match.teams[player.team_index].color
+        score_text = info_font.render(f"{player.std_score:.0f}", True, (200, 200, 200))
+        acc_text = info_font.render(f"{player.accuracy:.2f}%", True, (200, 200, 200))
+        combo_text = info_font.render(str(player.combo), True, color)
+
+        self.screen.blit(combo_text, (x+140-int(math.log10(max(1,player.combo)))*10,y+120))
+        
+        self.screen.blit(acc_text,(x+180,y))
+        self.screen.blit(score_text, (x+140-int(math.log10(max(1,player.std_score)))*10,y))
+
         # 玩家名称
         name_font = pygame.font.Font(None, 30)
         name_text = name_font.render(player.name, True, (255, 255, 255))
         self.screen.blit(name_text, (x, y))
-        
-        # 分数和准确率
-        info_font = pygame.font.Font(None, 24)
-        score_text = info_font.render(f"Score: {player.score:.0f}", True, (200, 200, 200))
-        acc_text = info_font.render(f"Acc: {player.accuracy:.2f}%", True, (200, 200, 200))
-        combo_text = info_font.render(f"Combo: {player.combo}", True, (255, 215, 0))
-        
-        self.screen.blit(score_text, (x, y + 30))
-        self.screen.blit(acc_text, (x, y + 55))
-        self.screen.blit(combo_text, (x, y + 80))
-        
+
         # 体力条
         pygame.draw.rect(self.screen, (100, 100, 100), [x, y + 110, 200, 15])  # 背景
         stamina_width = (player.stamina_left[0] + player.stamina_left[1]) / 20000 * 200

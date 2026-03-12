@@ -37,12 +37,12 @@ class Player:
             'bad': 0, 'miss': 0
         }
         
-        self._init_abilities()
+        self.init_abilities()
     def update_maxscore(self, total_combo):
         """在游戏启动时更新总分"""
         config = JudgementConfig
         self.max_score = total_combo * config.score_values['perfect_g'] + total_combo * 100
-    def _init_abilities(self):
+    def init_abilities(self):
         """基于玩家名生成随机但确定的能力值"""
         name_hash = hashlib.md5(self.name.encode()).hexdigest()
         hash_int = int(name_hash, 16)

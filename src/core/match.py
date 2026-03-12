@@ -11,7 +11,7 @@ class Match:
         self.results_file = results_file
         self.teams: List[Team] = []
         self.song_pool: List[Song] = []
-        self.selected_songs: List[Song] = []
+        self.selected_songs: List[Dict] = []
         
         self.scores: List[int] = [0, 0]  # 两队得分
         self.current_round: int = 0
@@ -27,9 +27,9 @@ class Match:
         """添加歌曲到曲库"""
         self.song_pool.append(song)
     
-    def select_song(self, song: Song):
+    def select_song(self, song: Song, team_index: int = 0):
         """选择一首歌进行比赛"""
-        self.selected_songs.append(song)
+        self.selected_songs.append({"song":song,"team":team_index})
         self.current_round = len(self.selected_songs) - 1
     
     def record_round_result(self, winning_team_index: int):
@@ -54,7 +54,7 @@ class Match:
                 self.winner = self.teams[i]
                 self.is_finished = True
                 break
-    def get_match_progress(self, load_results: bool = True) -> Dict:
+    def get_match_progress(self, load_results: bool = False) -> Dict:
         """获取比赛进度"""
         if load_results:
             self._load_total_results(self)

@@ -3,7 +3,7 @@ from typing import List
 from .player import Player
 
 class Team:
-    def __init__(self, name: str, color: tuple, player_names: List[str], id: int):
+    def __init__(self, name: str, color: tuple, player_names: List[str], id: int = 0):
         self.id = id
         self.name = name
         self.color = color
@@ -17,7 +17,7 @@ class Team:
     @property
     def total_score(self) -> float:
         """队伍总分数"""
-        return sum(player.score for player in self.players)
+        return sum(player.std_score for player in self.players)
     
     @property
     def avg_accuracy(self) -> float:
@@ -29,6 +29,7 @@ class Team:
     def reset_for_new_song(self):
         """为新歌曲重置玩家状态（保留能力值）"""
         for player in self.players:
+            player.init_abilities()
             player.score = 0.0
             player.combo = 0
             player.stamina_left = [10000, 10000]
