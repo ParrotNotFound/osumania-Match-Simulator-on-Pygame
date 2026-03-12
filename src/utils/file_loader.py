@@ -61,3 +61,24 @@ def load_teams(teams_file: str) -> List[Dict]:
             {'name': '蓝队', 'players': ['玩家4', '玩家5', '玩家6'], 'color': (0, 150, 255)}
         ]
     return teams
+
+def load_results(results_file) -> List[int]:
+    results = []
+    try:
+        with open(results_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        for i in lines:
+            results.append(int(i))
+        
+    except FileNotFoundError:
+        print(f"警告: 未找到比赛结果文件 {results_file}")
+    except Exception as e:
+        print(f"警告：找比赛结果文件发生错误：{e}")
+    return results
+
+def write_results(results_file, winner):
+    try:
+        with open(results_file, 'a', encoding='utf-8') as f:
+            f.write(f'{winner}\n')
+    except Exception as e:
+        print(f"警告：写入比赛结果文件发生错误：{e}")

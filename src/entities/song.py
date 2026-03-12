@@ -18,7 +18,7 @@ class Song:
         self.title = title
         self.artist = artist
         self.folder_path = folder_path
-        self.difficulty: Tuple[float, float] = (0.0, 0.0)  # (star_rating, approach_rate)
+        self.difficulty: Tuple[float, float] = (0.0, 0.0)  # (speed_rating, stamina_rating)
         self.notes: List[Note] = []
         self.audio_path: str = ""
         

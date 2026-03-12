@@ -3,8 +3,10 @@ import pygame
 from typing import Optional
 from ..entities.team import Team
 from ..entities.song import Song
+from ..entities.player import Player
 from .match import Match
 from .judge import JudgeSystem
+
 
 class OsuGame:
     def __init__(self, screen_width: int = 1280, screen_height: int = 720):
@@ -18,6 +20,7 @@ class OsuGame:
         self.clock = pygame.time.Clock()
         self.fps = 60
         self.running = False
+        self.max_render_dist = 1500
         
         # 游戏组件
         self.match: Optional[Match] = None
@@ -88,11 +91,29 @@ class OsuGame:
             
             # 更新音符状态
             self._update_notes()
-            
+            self._update_players()
             # 检查歌曲是否结束
             if not pygame.mixer.music.get_busy():
                 self._finish_song()
-    
+    def _update_notes(self):
+        current_note_time = self.current_time
+        try:
+            while(len(self.current_song.notes) > 0 and current_note_time < self.current_time + self.max_render_dist):
+                note = self.current_song.notes[0]
+                for t in self.match.teams:
+                    for p in t.players:
+                        p.active_notes.append(note)
+                current_note_time = note.time
+                self.current_song.notes.remove(note)
+        except Exception as e:
+            print(e)
+    def _update_players(self):
+        try:
+            for t in self.match.teams:
+                for p in t.players:
+                    p.play(self.current_time)
+        except Exception as e:
+            print(e)
     def _render(self):
         """渲染游戏画面"""
         self.screen.fill((0, 0, 0))  # 黑色背景
@@ -107,6 +128,17 @@ class OsuGame:
             self._render_results()
         
         pygame.display.flip()
+    def _render_team_big_points(self):
+        """显示大比分"""
+        myfont = pygame.font.Font(None, 40)
+        teams = self.match.teams
+        textImage = myfont.render(str(teams[0].name), True, teams[0].color)
+        self.screen.blit(textImage, (0,20))
+        t_width,t_height= myfont.size(str(teams[1].name))
+        textImage = myfont.render(str(teams[1].name), True, teams[1].color)
+        self.screen.blit(textImage, (1270-t_width,20))
+
+        
     def _render_menu(self):
         """初始页面，暂时不用，就放着"""
     def _render_song_select(self):
@@ -132,7 +164,7 @@ class OsuGame:
                                     True, (255, 255, 255))
         self.screen.blit(time_text, (600, 680))
     
-    def _render_player(self, player, x, y):
+    def _render_player(self, player: Player, x, y):
         """绘制单个玩家信息"""
         # 玩家名称
         name_font = pygame.font.Font(None, 30)

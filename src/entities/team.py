@@ -3,7 +3,8 @@ from typing import List
 from .player import Player
 
 class Team:
-    def __init__(self, name: str, color: tuple, player_names: List[str]):
+    def __init__(self, name: str, color: tuple, player_names: List[str], id: int):
+        self.id = id
         self.name = name
         self.color = color
         self.players: List[Player] = []
