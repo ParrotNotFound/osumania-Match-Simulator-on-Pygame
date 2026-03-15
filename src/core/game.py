@@ -25,12 +25,14 @@ class OsuGame:
         # 游戏组件
         self.match: Optional[Match] = Match("TEST",1)
         self.current_song: Optional[Song] = None
+        self.choose_song: Optional[str] = None
         self.judge_system = JudgeSystem()
         
         # 游戏状态
         self.game_state = "SONG_SELECT"  # MENU, SONG_SELECT, PLAYING, RESULTS
         self.current_time = 0
         self.song_start_time = 0
+        self.countdown = {"MENU":30000,"SONG_SELECT":30000}
         
         # 加载资源
         self._load_resources()
@@ -38,7 +40,7 @@ class OsuGame:
     def _load_resources(self):
         """加载游戏资源（歌曲、队伍等）"""
         # 这里调用utils中的加载函数
-        from ..utils.file_loader import load_songs, load_teams
+        from ..utils.file_loader import load_songs, load_teams, load_choose_id
         
         songs_data = load_songs("data/songs.txt")
         teams_data = load_teams("config/teams.txt")
@@ -54,7 +56,9 @@ class OsuGame:
         for i, team_data in enumerate(teams_data):
             team = Team(team_data['name'], team_data['color'], team_data['players'])
             self.match.add_team(team)
-    
+    def _load_select(self):
+        from ..utils.file_loader import load_choose_id
+        self.choose_song = load_choose_id("config/choose.txt")
     def run(self):
         """主游戏循环"""
         self.running = True
@@ -86,11 +90,19 @@ class OsuGame:
     
     def _update(self):
         """更新游戏逻辑"""
+        if self.game_state == "MENU":
+            self.current_time = pygame.time.get_ticks() - self.song_start_time
+            if(self.current_time > self.countdown["MENU"]):
+                self.game_state = "SONG_SELECT"
+                self._song_selection()
+                pygame.mixer.music = self.current_song.load_audio()
+                pygame.mixer.music.play()
+                self.song_start_time = pygame.time.get_ticks()
         if self.game_state == "SONG_SELECT":
             self.current_time = pygame.time.get_ticks() - self.song_start_time
-            if(self.current_time > 30000):
-                self._choose_song()
-                self.song_start_time = self.current_time
+            if(self.current_time > self.countdown["SONG_SELECT"]):
+                self.game_state = "PLAYING"
+                self.song_start_time = pygame.time.get_ticks() + 3000
         if self.game_state == "PLAYING":
             self.current_time = pygame.time.get_ticks() - self.song_start_time
             
@@ -100,6 +112,36 @@ class OsuGame:
             # 检查歌曲是否结束
             if not pygame.mixer.music.get_busy():
                 self._finish_song()
+    def _song_selection(self):
+        """选曲"""
+        try:
+            self._load_select()
+            for song in self.match.song_pool:
+                if song.id == self.choose_song[self.match.current_round]:
+                    self.match.select_song(song,self.match.current_round % 2)
+                    break
+            raise RuntimeError(f"未寻找到符合要求的选曲'{self.choose_song[self.match.current_round]}'！")
+        except Exception as e:
+            print(e)
+            song = self.match.song_pool[0]
+            self.match.select_song(song,self.match.current_round % 2)
+            
+            
+    def _finish_song(self):
+        """结束本场比赛"""
+        winning_team = 0
+        winning_score = 0
+        for i,team in enumerate(self.match.teams):
+            if winning_score < team.total_score():
+                winning_score = team.total_score
+                winning_team = i
+        self.match.record_round_result(i)
+        if self.match.is_finished():
+            self.game_state = "FINISHED"
+        else:
+            self.game_state = "MENU"
+        self.match.reset()
+
     def _update_notes(self):
         current_note_time = self.current_time
         try:
@@ -112,6 +154,7 @@ class OsuGame:
                 self.current_song.notes.remove(note)
         except Exception as e:
             print(e)
+
     def _update_players(self):
         try:
             for t in self.match.teams:
@@ -130,9 +173,20 @@ class OsuGame:
         elif self.game_state == "PLAYING":
             self._render_gameplay()
         elif self.game_state == "RESULTS":
-            self._render_results()
-        
+            self._render_results()# 待完成
+        elif self.game_state == "FINISHED":
+            self._render_ending()
         pygame.display.flip()
+
+    def _render_ending(self):
+        """显示比赛结果"""
+        self._render_team_big_points()
+        bigfont = pygame.font.Font(None, 70)
+        who_wins = self.match.winner
+        textImage = bigfont.render(who_wins, True, (255,255,255))
+        t_width,t_height= bigfont.size(who_wins)
+        self.screen.blit(textImage, (640-t_width/2,360))
+
     def _render_team_big_points(self):
         """显示大比分"""
         myfont = pygame.font.Font(None, 40)
@@ -152,7 +206,9 @@ class OsuGame:
             pygame.draw.rect(self.screen, clr[windata[1]>i], [640 + (0.5)*600 - i*40 ,20, 25, 25])
 
     def _render_menu(self):
-        """初始页面，暂时不用，就放着"""
+        """初始页面"""
+        self._render_song_select()
+
     def _render_song_select(self):
         """选歌页面"""
         self._render_team_big_points()
@@ -225,12 +281,17 @@ class OsuGame:
         time_text = time_font.render(f"Time: {self.current_time/1000:.1f}s", 
                                     True, (255, 255, 255))
         self.screen.blit(time_text, (600, 680))
-        # 最后再画大比分
+        # 最后再画大比分和歌名
+        songName = self.current_song.title
+        textImage = myfont.render(songName, True, (255,255,255))
+        t_width,t_height= myfont.size(songName)
+        self.screen.blit(textImage, (640-t_width/2,600))
         self._render_team_big_points()
+
     def _render_player(self, player: Player, x, y):
         """绘制单个玩家信息"""
         #背景板
-        pygame.draw.rect(self.screen, (0,0,0), [x, y,360, 480])
+        pygame.draw.rect(self.screen, (0,0,0), [x, y,240, 480])
         #键
         for note in player.active_notes:
             rect_width = 35

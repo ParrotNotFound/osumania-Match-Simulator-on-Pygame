@@ -35,4 +35,4 @@ class Team:
             player.stamina_left = [10000, 10000]
             player.tap_times = [0, 0, 0, 0]
             player.active_notes = []
-            player.judgement_counts = {k: 0 for k in ['perfect', 'great', 'good', 'bad', 'miss']}
+            player.judgement_counts = {k: 0 for k in ['perfect_g', 'perfect', 'great', 'good', 'bad', 'miss']}

@@ -31,12 +31,16 @@ class Match:
         """选择一首歌进行比赛"""
         self.selected_songs.append({"song":song,"team":team_index})
         self.current_round = len(self.selected_songs) - 1
-    
+    def reset(self):
+        """赛前重置"""
+        for team in self.teams:
+            team.reset_for_new_song()
     def record_round_result(self, winning_team_index: int):
         """记录一局结果"""
         self.scores[winning_team_index] += 1
         write_results(self.results_file,winning_team_index)
         # 检查是否有队伍获胜
+        self.current_round += 1
         for i, score in enumerate(self.scores):
             if score >= self.rounds_to_win:
                 self.winner = self.teams[i]

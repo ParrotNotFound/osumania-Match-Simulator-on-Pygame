@@ -33,7 +33,7 @@ class Player:
         
         # 判定统计
         self.judgement_counts: Dict[str, int] = {
-            'perfect': 0, 'great': 0, 'good': 0,
+            'perfect_g': 0,'perfect': 0, 'great': 0, 'good': 0,
             'bad': 0, 'miss': 0
         }
         

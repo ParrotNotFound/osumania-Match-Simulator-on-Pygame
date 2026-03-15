@@ -62,6 +62,16 @@ def load_teams(teams_file: str) -> List[Dict]:
         ]
     return teams
 
+def load_choose_id(choose_file) -> List[str]:
+    choose = []
+    try:
+        with open(choose_file, 'r', encoding='utf-8') as f:
+            choose = f.readlines()
+    except FileNotFoundError:
+        print(f"警告: 未找到选曲文件 {choose_file}")
+    except Exception as e:
+        print(f"警告：导入选曲文件发生错误：{e}")
+    return choose
 def load_results(results_file) -> List[int]:
     results = []
     try:
