@@ -61,7 +61,7 @@ class Match:
     def get_match_progress(self, load_results: bool = False) -> Dict:
         """获取比赛进度"""
         if load_results:
-            self._load_total_results(self)
+            self._load_total_results()
         return {
             'name': self.name,
             'scores': self.scores.copy(),

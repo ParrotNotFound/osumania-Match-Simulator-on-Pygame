@@ -28,7 +28,7 @@ class Player:
         
         # 实时状态
         self.stamina_left: List[int] = [10000, 10000]  # 左右手体力
-        self.tap_times: List[int] = [0, 0, 0, 0]  # 四个键位最后敲击时间
+        self.tap_times: List[int] = [-3000, -3000, -3000, -3000]  # 四个键位最后敲击时间
         self.active_notes: List[Note] = []  # 当前活跃音符
         
         # 判定统计
@@ -36,11 +36,15 @@ class Player:
             'perfect_g': 0,'perfect': 0, 'great': 0, 'good': 0,
             'bad': 0, 'miss': 0
         }
-        
+        self.last_judgement: str = ""
+        self.last_judge_time: Dict[str, int] = {
+            'perfect_g': -114514,'perfect': -114514, 'great': -114514, 'good': -114514,
+            'bad': -114514, 'miss': -114514
+        }
         self.init_abilities()
     def update_maxscore(self, total_combo):
         """在游戏启动时更新总分"""
-        config = JudgementConfig
+        config = JudgementConfig()
         self.max_score = total_combo * config.score_values['perfect_g'] + total_combo * 100
     def init_abilities(self):
         """基于玩家名生成随机但确定的能力值"""
@@ -56,22 +60,23 @@ class Player:
         self.stamina = min(75, values[0] + random.randint(-5, 15))
         self.speed = min(85, values[1] + random.randint(-5, 20))
         self.avg_accuracy = min(64, values[2] + random.randint(0, 20))
+        print(f'{self.name}\nspd:{self.speed}\nsta:{self.stamina}\nacc:{self.avg_accuracy}')
     #接下来为核心的游玩调用函数。游戏中每帧调用一次
     def play(self, current_time: int):
         """核心的游玩调用函数。游戏中每帧调用一次"""
-        for note in self.active_notes:
+        for note in self.active_notes[:10]:
             if self._judge_if_click(axis_to_4k(note.x),note.time,current_time):
                 self._process_hit(note,current_time)
     
     def _judge_if_click(self, track: int,tarTime: int,current_time: int) -> bool:
         """判断是否可以击打"""
-        stdacc = self.accuracy * 0.00025 + 0.3
-        tapdist = current_time - self.tap_times[track]
+        stdacc = self.avg_accuracy * 0.00025 + 0.3
+        tapdist = max(1,current_time - self.tap_times[track])
         timedist = tarTime - current_time
         use_sta = (5000+0.5*self.stamina_left[track>>1]) * ((0.015*self.stamina/70.0) + (0.015*(70-self.stamina)/70.0) * random.random()) * (150/tapdist)
 
-        ds=(pow(max(0,timedist),2.2)+max(0,270-use_sta * (1+self.speed*0.02)-pow(tapdist*200,0.5)))*0.5
-        tap_psb = min(self.accuracy*(tapdist/(64-self.speed*0.2))*(0.75+self.stamina_left[track>>1]/20000),1/max(1,ds))
+        ds=(pow(max(0,timedist),2.2)+max(0,270-use_sta * (1+self.speed*0.02)-pow(abs(tapdist)*200,0.5)))*0.5
+        tap_psb = min(stdacc*(tapdist/(64-self.speed*0.2))*(0.75+self.stamina_left[track>>1]/20000),1/max(1,ds))
         #神秘代码两行，怎么干的我自己都忘了
         if random.random()<tap_psb:
             #print(230-use_sta * (1+spd*0.02)-tapdist)
@@ -82,7 +87,7 @@ class Player:
         
     def _process_hit(self,note: Note, current_time: int, judge_system = JudgeSystem() ) -> Dict[str, Any]:
         """处理一次击打，返回判定结果和分数"""
-        note_time = Note.time
+        note_time = note.time
         time_diff = note_time - current_time
         judgement = judge_system.get_judgement(time_diff)
         score_info = self._calculate_score(judgement, judge_system)
@@ -98,9 +103,8 @@ class Player:
             self.max_combo = max(self.max_combo, self.combo)
         else:
             self.combo = 0
-            
-        self.score = score_info['score']
         self.judgement_counts[judgement] = self.judgement_counts.get(judgement, 0) + 1
+        self.tap_times[axis_to_4k(note.x)] = current_time
         self._update_accuracy()
         
         return {
@@ -109,13 +113,14 @@ class Player:
             'time_diff': time_diff
         }
     def _calculate_score(self,judgement,judge_system = JudgeSystem()):
-        self.bonus += judge_system.config.bonus_values(judgement)
+        self.bonus += judge_system.config.bonus_values[judgement]
         if self.bonus > 100.0:
             self.bonus = 100
         elif self.bonus < 0:
             self.bonus = 0
-        self.score += judge_system.config.score_values + self.bonus
+        self.score += judge_system.config.score_values[judgement] + self.bonus
         self.std_score = self.score * 1000000.0 / self.max_score
+        return {'score':self.std_score}
         """标准化增加分数"""
     def _update_accuracy(self):
         """重新计算准确率"""

@@ -33,6 +33,6 @@ class Team:
             player.score = 0.0
             player.combo = 0
             player.stamina_left = [10000, 10000]
-            player.tap_times = [0, 0, 0, 0]
+            player.tap_times = [-3000, -3000, -3000, -3000]  
             player.active_notes = []
             player.judgement_counts = {k: 0 for k in ['perfect_g', 'perfect', 'great', 'good', 'bad', 'miss']}

@@ -48,12 +48,12 @@ class Song:
             print(f"加载谱面失败: {e}")
             return False
             
-    def load_audio(self) -> pygame.mixer.Sound:
+    def load_audio(self) -> str:
         """加载音频文件"""
         # 尝试多种音频格式
         for ext in ['.mp3', '.ogg', '.wav']:
             audio_path = f"{self.folder_path}/audio{ext}"
             if os.path.exists(audio_path):
                 self.audio_path = audio_path
-                return pygame.mixer.Sound(audio_path)
+                return audio_path
         raise FileNotFoundError(f"在 {self.folder_path} 中未找到音频文件")

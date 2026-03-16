@@ -5,8 +5,8 @@ from typing import Dict, Any
 @dataclass
 class JudgementConfig:
     """判定窗口配置"""
-    perfect_g: int = 10
-    perfect: int = 30
+    perfect_g: int = 5
+    perfect: int = 25
     great: int = 45
     good: int = 60
     bad: int = 80
