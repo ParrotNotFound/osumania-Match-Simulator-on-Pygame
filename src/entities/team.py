@@ -11,7 +11,7 @@ class Team:
         
         # 初始化队员
         for i, player_name in enumerate(player_names):
-            player = Player(player_name, team_index=0 if "red" in name.lower() else 1, player_index=i)
+            player = Player(player_name, team_index=id, player_index=i)
             self.players.append(player)
     
     @property
@@ -35,4 +35,6 @@ class Team:
             player.stamina_left = [10000, 10000]
             player.tap_times = [-3000, -3000, -3000, -3000]  
             player.active_notes = []
+            player.last_judgement = ""
+            player.last_judge_time = {k: -114514 for k in ['perfect_g', 'perfect', 'great', 'good', 'bad', 'miss']}
             player.judgement_counts = {k: 0 for k in ['perfect_g', 'perfect', 'great', 'good', 'bad', 'miss']}

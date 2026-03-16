@@ -38,7 +38,7 @@ class Player:
         }
         self.last_judgement: str = ""
         self.last_judge_time: Dict[str, int] = {
-            'perfect_g': -114514,'perfect': -114514, 'great': -114514, 'good': -114514,
+            '': -114514, 'perfect_g': -114514,'perfect': -114514, 'great': -114514, 'good': -114514,
             'bad': -114514, 'miss': -114514
         }
         self.init_abilities()
@@ -72,6 +72,8 @@ class Player:
         """判断是否可以击打"""
         stdacc = self.avg_accuracy * 0.00025 + 0.3
         tapdist = max(1,current_time - self.tap_times[track])
+        if tapdist == 1:
+            return False
         timedist = tarTime - current_time
         use_sta = (5000+0.5*self.stamina_left[track>>1]) * ((0.015*self.stamina/70.0) + (0.015*(70-self.stamina)/70.0) * random.random()) * (150/tapdist)
 
@@ -105,6 +107,8 @@ class Player:
             self.combo = 0
         self.judgement_counts[judgement] = self.judgement_counts.get(judgement, 0) + 1
         self.tap_times[axis_to_4k(note.x)] = current_time
+        self.last_judge_time[judgement] = current_time
+        self.last_judgement = self.last_judgement if judgement == 'perfect_g' or judgement == 'perfect' else judgement
         self._update_accuracy()
         
         return {

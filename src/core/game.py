@@ -23,7 +23,7 @@ class OsuGame:
         self.max_render_dist = 1200
         
         # 游戏组件
-        self.match: Optional[Match] = Match("TEST",1)
+        self.match: Optional[Match] = Match("TEST",2)
         self.current_song: Optional[Song] = None
         self.choose_song: Optional[str] = None
         self.judge_system = JudgeSystem()
@@ -57,9 +57,9 @@ class OsuGame:
         
         # 创建Team对象
         for i, team_data in enumerate(teams_data):
-            team = Team(team_data['name'], team_data['color'], team_data['players'])
+            team = Team(team_data['name'], team_data['color'], team_data['players'],i)
             self.match.add_team(team)
-
+        # 进度更新
         self.match.get_match_progress(True)
 
     def _load_fonts(self,font = None):
@@ -220,12 +220,12 @@ class OsuGame:
 
     def _render_team_big_points(self):
         """显示大比分"""
-        myfont = pygame.font.Font(None, 40)
+        # myfont = pygame.font.Font(None, 40)
         teams = self.match.teams
-        textImage = myfont.render(str(teams[0].name), True, teams[0].color)
+        textImage = self.font[40].render(str(teams[0].name), True, teams[0].color)
         self.screen.blit(textImage, (0,20))
-        t_width,t_height= myfont.size(str(teams[1].name))
-        textImage = myfont.render(str(teams[1].name), True, teams[1].color)
+        t_width,t_height= self.font[40].size(str(teams[1].name))
+        textImage = self.font[40].render(str(teams[1].name), True, teams[1].color)
         self.screen.blit(textImage, (1270-t_width,20))
         # 队名后为比分显示
         progress = self.match.get_match_progress(False)
@@ -344,10 +344,17 @@ class OsuGame:
         self.screen.blit(acc_text,(x+180,y))
         self.screen.blit(score_text, (x+140-int(math.log10(max(1,player.std_score)))*10,y))
 
+        judge_text = "" if player.last_judge_time[player.last_judgement] < self.current_time - (400 if player.last_judgement == 'great' else 1000) else player.last_judgement
         # 玩家名称
+        # print( player.last_judge_time[player.last_judgement] -( self.current_time + 800))
+        judge_color = {'':(0,0,0),'perfect_g':(255,193,37),'perfect':(255,193,37),'great':(127,255,0),'good':(135,206,250),'bad':(100,100,100),'miss':(255,0,0)}
+        t_width,t_height= self.fonts[30].size(judge_text.upper())
+        textImage = self.fonts[30].render(judge_text.upper(),True,judge_color[judge_text])
+        self.screen.blit(textImage, (x+140-t_width/2,y+150))
         # name_font = pygame.font.Font(None, 30)
-        name_text = self.fonts[30].render(player.name, True, (255, 255, 255))
-        self.screen.blit(name_text, (x, y))
+        last_miss = max(0,255 + 0.1*(player.last_judge_time['miss'] - self.current_time))
+        name_text = self.fonts[30].render(player.name, True, (255, 255-last_miss, 255-last_miss))
+        self.screen.blit(name_text, (x+50+19.2, y+260))
 
         # 体力条(弃用)
         # pygame.draw.rect(self.screen, (100, 100, 100), [x, y + 110, 200, 15])  # 背景

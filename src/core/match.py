@@ -49,9 +49,11 @@ class Match:
     def _load_total_results(self):
         results = load_results(self.results_file)
         self.scores = [0,0]
+        # self.selected_songs = {}
         self.current_round = 0
         for i in results:
             self.scores[i] += 1
+            self.select_song(self.song_pool)
             self.current_round += 1
         for i, score in enumerate(self.scores):
             if score >= self.rounds_to_win:
