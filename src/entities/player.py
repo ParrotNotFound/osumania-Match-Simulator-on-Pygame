@@ -77,12 +77,12 @@ class Player:
         timedist = tarTime - current_time
         use_sta = (5000+0.5*self.stamina_left[track>>1]) * ((0.015*self.stamina/70.0) + (0.015*(70-self.stamina)/70.0) * random.random()) * (150/tapdist)
 
-        ds=(pow(max(0,timedist),2.2)+max(0,270-use_sta * (1+self.speed*0.02)-pow(abs(tapdist)*200,0.5)))*0.5
+        ds=(pow(max(0,timedist),2.2)+max(0,270-use_sta * (1+self.speed*0.03)-pow(abs(tapdist)*200,0.5)))*0.5
         tap_psb = min(stdacc*(tapdist/(64-self.speed*0.2))*(0.75+self.stamina_left[track>>1]/20000),1/max(1,ds))
         #神秘代码两行，怎么干的我自己都忘了
         if random.random()<tap_psb:
             #print(230-use_sta * (1+spd*0.02)-tapdist)
-            self.stamina_left[track>>1] = max(0,self.stamina_left[track>>1]-use_sta*2.2)
+            self.stamina_left[track>>1] = max(0,self.stamina_left[track>>1]-use_sta*2)
             return True
         else:
             return False
