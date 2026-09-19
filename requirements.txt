@@ -1,0 +1,3 @@
+# 运行只需要 pygame。pygame-ce 与 pygame 用法一致，
+# 且对新版本 Python（3.13/3.14）支持更好，所以优先装 pygame-ce。
+pygame-ce>=2.5.8

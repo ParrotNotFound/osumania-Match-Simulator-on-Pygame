@@ -7,6 +7,8 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
+.venv*/
 .vscode/
 
 # IDE
@@ -28,8 +30,15 @@ Thumbs.db
 # Pygame缓存
 pygame/
 
+# 本地依赖缓存
+wheelhouse/
+.piptmp*/
+*.whl
+
 # 个人配置文件
 config/local_*.yaml
 secrets.ini
+
+# 游戏资源与运行数据（谱面、音频、比赛记录）
 data/
 config/

@@ -1,50 +1,63 @@
 # src/core/judge.py
-from dataclasses import dataclass
-from typing import Dict, Any
+"""判定系统：把"打早了/打晚了多少毫秒"换算成判定等级与分值。"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+from ..utils.config import DEFAULT_BONUS, DEFAULT_SCORES, JudgeSettings
+
 
 @dataclass
 class JudgementConfig:
-    """判定窗口配置"""
+    """判定窗口与分值配置（数值全部来自 config.toml 的 [judge] 段）"""
     perfect_g: int = 5
     perfect: int = 25
     great: int = 45
     good: int = 60
     bad: int = 80
+    # 超过 miss 毫秒还没打中就按漏掉处理（由 Player 用来清理过期的音符）
     miss: int = 80
-    
-    score_values: Dict[str, int] = None
-    bonus_values: Dict[str, float] = None
-    
-    def __post_init__(self):
-        if self.score_values is None:
-            self.score_values = {
-                'perfect_g': 320, 'perfect': 300, 'great': 200, 'good': 100,
-                'bad': 50, 'miss': 0
-            }
-        if self.bonus_values is None:
-            self.bonus_values = {
-                'perfect_g': 0.5, 'perfect': 0.25, 'great': 0, 'good': -1,
-                'bad': -3, 'miss': -50
-            }
+    score_values: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SCORES))
+    bonus_values: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_BONUS))
+    bonus_start: float = 100.0
+    bonus_max: float = 100.0
+
+    @classmethod
+    def from_settings(cls, settings: JudgeSettings) -> "JudgementConfig":
+        return cls(
+            perfect_g=settings.perfect_g,
+            perfect=settings.perfect,
+            great=settings.great,
+            good=settings.good,
+            bad=settings.bad,
+            miss=settings.miss,
+            score_values=dict(settings.score),
+            bonus_values=dict(settings.bonus),
+            bonus_start=settings.bonus_start,
+            bonus_max=settings.bonus_max,
+        )
+
 
 class JudgeSystem:
-    def __init__(self, config: JudgementConfig = None):
+    def __init__(self, config: Optional[JudgementConfig] = None):
         self.config = config or JudgementConfig()
-    
+
     def get_judgement(self, time_diff: int) -> str:
-        """根据时间差返回判定结果"""
+        """根据时间差（谱面时间 - 当前时间）返回判定结果。
+
+        负数代表打早了，正数代表打晚了；超过 bad 窗口一律算 miss。
+        """
         abs_diff = abs(time_diff)
-        if abs_diff <= self.config.perfect:
+        cfg = self.config
+        if abs_diff <= cfg.perfect_g:
             return 'perfect_g'
-        if abs_diff <= self.config.perfect:
+        if abs_diff <= cfg.perfect:
             return 'perfect'
-        elif abs_diff <= self.config.great:
+        if abs_diff <= cfg.great:
             return 'great'
-        elif abs_diff <= self.config.good:
+        if abs_diff <= cfg.good:
             return 'good'
-        elif abs_diff <= self.config.bad:
+        if abs_diff <= cfg.bad:
             return 'bad'
-        elif abs_diff <= self.config.miss:
-            return 'miss'
-        return 'miss'  # 超时
-    
+        return 'miss'
