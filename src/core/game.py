@@ -2,27 +2,58 @@
 """主游戏循环：状态机 + 全部渲染。
 
 状态流转：
-    MENU（菜单，停 countdown_menu 毫秒）
-      -> SONG_SELECT（选曲界面，停 countdown_song_select 毫秒）
-      -> PLAYING（对局：先空等 lead_in 毫秒，音乐响起后开始判定）
-      -> 分出这一局胜负 -> MENU，或比赛结束 -> FINISHED
+    MENU（启动后停 start_delay 毫秒，展示曲库）
+      -> SONG_SELECT（选曲界面，停 song_select_delay 毫秒，期间选出本轮曲目）
+      -> PLAYING（先空等 match_start_delay 毫秒，音乐响起后开始判定）
+      -> RESULTS（本局成绩展示 results_delay 毫秒）
+      -> 回到 SONG_SELECT，或比赛已分胜负 -> FINISHED
 """
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional
+import os
+from typing import Dict, Optional, Tuple
 
 import pygame
 
 from ..entities.player import Player
 from ..entities.song import Song
 from ..entities.team import Team
-from ..utils.config import DEFAULT_POOL_COLOR, ConfigError, GameConfig, load_config
-from ..utils.file_loader import clear_results
+from ..utils.config import DEFAULT_POOL_COLOR, JUDGEMENTS, ConfigError, GameConfig, load_config
 from .judge import JudgeSystem, JudgementConfig
 from .match import Match
 
 FONT_SIZES = tuple(range(20, 80, 5))
+
+# pygame 默认字体没有中文字形（会渲染成方块），所以优先找一个系统里带中文的字体
+CJK_FONT_CANDIDATES = (
+    r"C:\Windows\Fonts\msyh.ttc",      # 微软雅黑
+    r"C:\Windows\Fonts\simhei.ttf",    # 黑体
+    r"C:\Windows\Fonts\simsun.ttc",    # 宋体
+    "/System/Library/Fonts/PingFang.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+)
+
+
+def _find_cjk_font() -> Optional[str]:
+    """找一个带中文字形的字体文件，找不到就返回 None（退回 pygame 默认字体）。"""
+    for path in CJK_FONT_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
+
+# 第四轨右侧那列判定计数的小字号
+JUDGEMENT_COUNT_FONT_SIZE = 18
+# 判定计数的颜色，顺序同 JUDGEMENTS：完美+ 黄 / 完美 橙 / 很好 绿 / 好 蓝 / 差 淡灰 / 漏 红
+JUDGEMENT_COUNT_COLORS: Dict[str, Tuple[int, int, int]] = {
+    'perfect_g': (255, 255, 0),
+    'perfect': (255, 165, 0),
+    'great': (0, 255, 0),
+    'good': (135, 206, 250),
+    'bad': (170, 170, 170),
+    'miss': (255, 0, 0),
+}
 
 
 class OsuGame:
@@ -59,7 +90,8 @@ class OsuGame:
         self.match = Match(
             name=config.match.name,
             rounds_to_win=config.match.rounds_to_win,
-            results_file=config.resolve(config.match.results_file),
+            results=config.match.results,
+            config_path=config.path,
             picks=config.picks,
             judge_system=self.judge_system,
         )
@@ -68,12 +100,13 @@ class OsuGame:
         self.playlist: list = []
 
         # 游戏状态
-        self.game_state = "MENU"  # MENU, SONG_SELECT, PLAYING, FINISHED
+        self.game_state = "MENU"  # MENU, SONG_SELECT, PLAYING, RESULTS, FINISHED
         self.state_entered_at = 0
-        self.current_time = 0     # 歌曲时间轴（负数代表还在 lead_in）
+        self.current_time = 0     # 歌曲时间轴（负数代表还在 match_start_delay 的准备时间里）
         self.song_start_time = 0
         self.last_frame_tick = 0
         self.music_started = False
+        self.round_winner = None  # 刚打完那一局的胜者，用于成绩展示
 
         # 加载字体与资源
         self.fonts: Dict[int, pygame.font.Font] = {}
@@ -89,8 +122,26 @@ class OsuGame:
     # 初始化
     # ------------------------------------------------------------------
     def _load_fonts(self, font: Optional[str] = None) -> None:
+        """准备两套字体。
+
+        `self.fonts` 用 pygame 默认字体渲染数字/英文 —— 原来的排版全是按它的宽度调的；
+        `self.cjk_fonts` 是带中文字形的字体，只在文本里出现非 ASCII 时才用（见 `_font`），
+        这样加中文不会把已有排版挤歪。
+        """
+        cjk_path = font or _find_cjk_font()
+        self.cjk_fonts: Optional[Dict[int, pygame.font.Font]] = {} if cjk_path else None
         for size in FONT_SIZES:
             self.fonts[size] = pygame.font.Font(font, size)
+            if cjk_path:
+                self.cjk_fonts[size] = pygame.font.Font(cjk_path, size)
+        # 第四轨右侧那列判定计数用的小字（纯数字，用默认字体）
+        self.count_font = pygame.font.Font(font, JUDGEMENT_COUNT_FONT_SIZE)
+
+    def _font(self, size: int, text: object) -> pygame.font.Font:
+        """按文本内容选字体：含非 ASCII 字符用中文字体，否则用默认字体。"""
+        if self.cjk_fonts is None:
+            return self.fonts[size]
+        return self.cjk_fonts[size] if any(ord(ch) > 127 for ch in str(text)) else self.fonts[size]
 
     def _load_resources(self) -> None:
         """按配置加载曲库与队伍（玩家、选曲、曲目全部来自 config.toml）"""
@@ -108,14 +159,31 @@ class OsuGame:
             self.match.add_team(Team(team_config, team_id=index, judge_system=self.judge_system))
 
     def _restore_or_reset_results(self) -> None:
-        """根据 [match] resume 决定是接着上次的比赛，还是重开一局。"""
+        """启动时按 [match] resume 决定：接着缓存里的比赛，还是重开一场。
+
+        赛果缓存就存在 config.toml 的 [match] results 里，每局打完都会写回去。
+        """
+        cached = list(self.match.results)
+
+        if self.config.match.resume and cached:
+            self.match.apply_cached_results()
+
+        if self.match.is_finished:
+            # 缓存里的比赛已经分出胜负，没法接着打，直接开新的一场
+            print(f"提示：缓存里的比赛已经打完（{self.match.winner.name} 以 "
+                  f"{self.match.scores[0]}:{self.match.scores[1]} 获胜），这次重新开一场；"
+                  f"想看这份成绩可以翻 config.toml 的 [match] results")
+            self.match.clear_results()
+            self.match.reset_progress()
+            return
+
         if self.config.match.resume:
-            self.match.get_match_progress(True)
-            if self.match.is_finished:
-                print("读到的比赛记录已经分出胜负，直接进入结算画面"
-                      "（想重新开始比赛，把 config.toml 里 [match] resume 改成 false）")
-        else:
-            clear_results(self.match.results_file)
+            if cached:
+                print(f"提示：接着缓存里的比赛继续 —— 已打 {len(cached)} 局，大比分 "
+                      f"{self.match.scores[0]}:{self.match.scores[1]}")
+        elif cached:
+            print(f"提示：[match] resume = false，已清空缓存里的 {len(cached)} 局赛果，重新开赛")
+            self.match.clear_results()
 
     def run(self) -> None:
         """主游戏循环"""
@@ -152,15 +220,67 @@ class OsuGame:
         return pygame.time.get_ticks() - self.state_entered_at
 
     def _update(self) -> None:
-        """更新游戏逻辑"""
+        """更新游戏逻辑
+
+        一个完整循环：
+            MENU(start_delay) -> SONG_SELECT(song_select_delay)
+              -> PLAYING(match_start_delay 后开打) -> RESULTS(results_delay) -> 回到 SONG_SELECT
+            某队达到胜场后 RESULTS 结束即进入 FINISHED。
+        """
         if self.game_state == "MENU":
-            if self._state_elapsed() > self.settings.countdown_menu:
+            if self._state_elapsed() > self.settings.start_delay:
                 self._start_song_select()
         elif self.game_state == "SONG_SELECT":
-            if self._state_elapsed() > self.settings.countdown_song_select:
+            if self._state_elapsed() > self.settings.song_select_delay:
                 self._start_playing()
         elif self.game_state == "PLAYING":
             self._update_playing()
+        elif self.game_state == "RESULTS":
+            if self._state_elapsed() > self.settings.results_delay:
+                if self.match.is_finished:
+                    self._set_state("FINISHED")
+                else:
+                    # 必须走 _start_song_select：它会重新选曲 + 重新结算选手
+                    # （换名单、重掷能力值、清空上一局状态）。直接切 SONG_SELECT 会漏掉这些，
+                    # 导致第二局拿上一局的旧谱面和旧状态重打。
+                    self._start_song_select()
+
+    def _time_until_match_start(self) -> Optional[float]:
+        """距离"比赛真正开始"还有多少毫秒；已经开打或没有下一场时返回 None。
+
+        跨越多个阶段累计：等待阶段把后面几个阶段的时长一起算进去，
+        所以从启动开始这个数字是一路连续倒数到 0 的。
+        """
+        settings = self.settings
+        if self.game_state == "MENU":
+            remaining = (settings.start_delay - self._state_elapsed()
+                         + settings.song_select_delay + settings.match_start_delay)
+        elif self.game_state == "SONG_SELECT":
+            remaining = (settings.song_select_delay - self._state_elapsed()
+                         + settings.match_start_delay)
+        elif self.game_state == "RESULTS":
+            if self.match.is_finished:
+                return None
+            remaining = (settings.results_delay - self._state_elapsed()
+                         + settings.song_select_delay + settings.match_start_delay)
+        elif self.game_state == "PLAYING":
+            if self.music_started:
+                return None
+            remaining = -self.current_time   # 开打前的准备时间里 current_time 是负数
+        else:
+            return None
+        return max(0.0, float(remaining))
+
+    def _song_progress(self) -> float:
+        """已经结算过的音符 / 总音符数（0~1）。
+
+        每个音符对所有选手都只结算一次，所以取任意一名选手的判定计数之和就是完成数。
+        """
+        total = self.current_song.judgement_count if self.current_song else 0
+        if total <= 0 or not self.match.teams or not self.match.teams[0].players:
+            return 0.0
+        done = sum(self.match.teams[0].players[0].judgement_counts.values())
+        return min(1.0, done / total)
 
     def _start_song_select(self) -> None:
         """选曲：选出这一轮要打的歌，并播放它的试听片段"""
@@ -196,7 +316,7 @@ class OsuGame:
         for team in self.match.teams:
             for player in team.players:
                 player.match_point = match_point
-                player.update_maxscore(len(song.notes))
+                player.update_maxscore(song.judgement_count)
 
         self._print_abilities(round_index, song)
 
@@ -236,7 +356,7 @@ class OsuGame:
               f"括号内为本局手感偏移）")
 
     def _start_playing(self) -> None:
-        """进入对局：先留 lead_in 毫秒的准备时间，再开始放歌。
+        """进入对局：先留 match_start_delay 毫秒的准备时间，再开始放歌。
 
         注意：音频必须在这里（而不是歌曲时间走到 0 的那一帧）载入。
         如果淡出还没结束就调用 music.load()，SDL_mixer 会一直阻塞到淡出结束，
@@ -247,8 +367,8 @@ class OsuGame:
         if song is not None:
             self._load_song_audio(song)
 
-        self.song_start_time = pygame.time.get_ticks() + self.settings.lead_in
-        self.current_time = -self.settings.lead_in
+        self.song_start_time = pygame.time.get_ticks() + self.settings.match_start_delay
+        self.current_time = -self.settings.match_start_delay
         self.last_frame_tick = pygame.time.get_ticks()
         self.music_started = False
         self._set_state("PLAYING")
@@ -270,7 +390,7 @@ class OsuGame:
             print(f"警告：对局中卡顿了 {frame_gap}ms，可能有音符被跳过")
 
         if not self.music_started:
-            # lead_in 期间不判定，音符也不会提前滚出来
+            # 开打前的准备时间里不判定，音符也不会提前滚出来
             if self.current_time >= 0:
                 self.music_started = True
                 self._play_song_audio()
@@ -302,7 +422,8 @@ class OsuGame:
             return True
         if self.playlist:
             return False
-        if any(player.active_notes for team in self.match.teams for player in team.players):
+        if any(player.active_notes or player.holding_notes
+               for team in self.match.teams for player in team.players):
             return False
         if self._music_busy():
             return False
@@ -314,11 +435,9 @@ class OsuGame:
         winning_team = max(range(len(totals)), key=lambda index: totals[index]) if totals else 0
         self.match.record_round_result(winning_team)
         self._stop_music()
+        self.round_winner = self.match.teams[winning_team] if winning_team < len(self.match.teams) else None
         # 玩家状态与能力值留到下一首开始时由 _prepare_players 统一重置
-        if self.match.is_finished:
-            self._set_state("FINISHED")
-        else:
-            self._set_state("MENU")
+        self._set_state("RESULTS")
 
     # ------------------------------------------------------------------
     # 音频（没声卡时全部退化成空操作）
@@ -379,12 +498,73 @@ class OsuGame:
             self._render_song_select()
         elif self.game_state == "PLAYING":
             self._render_gameplay()
+        elif self.game_state == "RESULTS":
+            self._render_results()
         elif self.game_state == "FINISHED":
             self._render_ending()
 
+        self._render_status_hud()
         if self.settings.debug:
             self._render_debug_info()
         pygame.display.flip()
+
+    def _render_status_hud(self) -> None:
+        """等待/进行中的实时信息。
+
+        - 等待期间（MENU / SONG_SELECT / 开打前的准备时间 / RESULTS）在**左下角**
+          显示 Countdown:xx，xx 是距离比赛真正开始的剩余秒数；
+        - 比赛开始后在**屏幕中央**显示已结算音符的占比，只有数字。
+        """
+        if self.game_state == "PLAYING" and self.music_started:
+            text = f"{self._song_progress() * 100:.1f}%"
+            color = (200, 255, 200)
+            font = self.fonts[55]
+            centered = True
+        else:
+            remaining = self._time_until_match_start()
+            if remaining is None:
+                return
+            text = f"Countdown:{remaining / 1000:.1f}"
+            color = (255, 235, 120)
+            font = self.fonts[30] if self.game_state == "RESULTS" else self.fonts[55]
+            centered = False
+
+        text_image = font.render(text, True, color)
+        rect = (text_image.get_rect(center=(640, 360)) if centered
+                else text_image.get_rect(bottomleft=(20, 700)))
+        # 压到别的内容上时垫一层半透明黑底：既看得清又不会完全挡住
+        backing = pygame.Surface(rect.inflate(24, 12).size, pygame.SRCALPHA)
+        backing.fill((0, 0, 0, 190))
+        self.screen.blit(backing, rect.inflate(24, 12).topleft)
+        self.screen.blit(text_image, rect)
+
+    def _render_results(self) -> None:
+        """一局打完后展示本局成绩（停 results_delay 毫秒）"""
+        self._render_team_big_points()
+
+        title_text = f"第 {self.match.current_round + 1} 局结束"
+        title = self._font(50, title_text).render(title_text, True, (255, 255, 255))
+        self.screen.blit(title, (640 - title.get_width() / 2, 120))
+
+        if self.round_winner is not None:
+            win_text = f"{self.round_winner.name} 拿下本局"
+            win_image = self._font(40, win_text).render(win_text, True, self.round_winner.color)
+            self.screen.blit(win_image, (640 - win_image.get_width() / 2, 180))
+
+        # 两队各自的队员成绩
+        for team_index, team in enumerate(self.match.teams):
+            base_x = 200 + team_index * 560
+            head = f"{team.name}  {team.total_score:.0f}"
+            self.screen.blit(self._font(30, head).render(head, True, team.color), (base_x, 250))
+            for row, player in enumerate(team.players):
+                line = f"{player.name}   {player.std_score:>8.0f}   {player.accuracy:6.2f}%"
+                self.screen.blit(self._font(30, line).render(line, True, (200, 200, 200)),
+                                 (base_x, 290 + row * 34))
+
+        scores = self.match.scores or [0, 0]
+        big_text = f"大比分 {scores[0]} : {scores[1]}"
+        big = self._font(40, big_text).render(big_text, True, (255, 255, 255))
+        self.screen.blit(big, (640 - big.get_width() / 2, 400))
 
     def _render_debug_info(self) -> None:
         text = f"{self.current_time}ms  state={self.game_state}  fps={self.clock.get_fps():.0f}"
@@ -394,10 +574,10 @@ class OsuGame:
     def _render_ending(self) -> None:
         """显示比赛结果"""
         self._render_team_big_points()
-        bigfont = pygame.font.Font(None, 70)
+        bigfont = self._font(70, "wins")
         who_wins = f"{self.match.winner.name} wins!" if self.match.winner else "Match over"
-        text_image = bigfont.render(who_wins, True, (255, 255, 255))
-        t_width, _ = bigfont.size(who_wins)
+        text_image = self._font(70, who_wins).render(who_wins, True, (255, 255, 255))
+        t_width, _ = self._font(70, who_wins).size(who_wins)
         self.screen.blit(text_image, (640 - t_width / 2, 360))
 
     def _render_team_big_points(self) -> None:
@@ -406,12 +586,12 @@ class OsuGame:
         if not teams:
             return
 
-        text_image = self.fonts[40].render(str(teams[0].name), True, teams[0].color)
+        text_image = self._font(40, teams[0].name).render(str(teams[0].name), True, teams[0].color)
         self.screen.blit(text_image, (0, 20))
 
         if len(teams) > 1:
-            t_width, _ = self.fonts[40].size(str(teams[1].name))
-            text_image = self.fonts[40].render(str(teams[1].name), True, teams[1].color)
+            t_width, _ = self._font(40, teams[1].name).size(str(teams[1].name))
+            text_image = self._font(40, teams[1].name).render(str(teams[1].name), True, teams[1].color)
             self.screen.blit(text_image, (1270 - t_width, 20))
 
         # 队名后面是小分（赢一局点一个格子）
@@ -455,7 +635,7 @@ class OsuGame:
             key_color = self.pool_colors.get(song_key[:2].upper(), DEFAULT_POOL_COLOR)
             text_image = self.fonts[40].render(song_key, True, key_color)
             self.screen.blit(text_image, (640 - s_width / 2 + 10, 80 + index * s_height))
-            text_image = self.fonts[40].render(song.title, True, (255, 255, 255))
+            text_image = self._font(40, song.title).render(song.title, True, (255, 255, 255))
             self.screen.blit(text_image, (640 - s_width / 2 + 80, 80 + index * s_height))
 
     def _render_gameplay(self) -> None:
@@ -465,10 +645,10 @@ class OsuGame:
             return
 
         for index, team in enumerate(teams):
-            # 队伍总分
-            score_text = self.fonts[50].render(f"{team.name}: {team.total_score:.0f}", True, team.color)
-            self.screen.blit(score_text, (50 + index * 900, 20))
-
+            # 这里原来还画了一行 f"{队名}: {总分}"，但它和 _render_team_big_points
+            # 画在同一行 y=20 上：队 1 那边重叠 80px（整个队名都被压住），
+            # 分数每帧都在涨，重叠处就一直在闪。总分在屏幕底部中央本来就有大数字，
+            # 所以这一行直接去掉。
             # 玩家信息
             for player_index, player in enumerate(team.players):
                 xpos = [150, 0, 300]
@@ -501,8 +681,8 @@ class OsuGame:
 
         # 最后再画大比分和歌名
         song_name = self.current_song.title
-        text_image = self.fonts[40].render(song_name, True, (255, 255, 255))
-        t_width, _ = self.fonts[40].size(song_name)
+        text_image = self._font(40, song_name).render(song_name, True, (255, 255, 255))
+        t_width, _ = self._font(40, song_name).size(song_name)
         self.screen.blit(text_image, (640 - t_width / 2, 600))
         self._render_team_big_points()
 
@@ -511,11 +691,20 @@ class OsuGame:
         # 背景板
         pygame.draw.rect(self.screen, (0, 0, 0), [x, y, 240, 290])
 
-        # 音符
-        for note in player.active_notes:
+        # 音符（普通音符 = 一个头；长条 = 一个头 + 一条又深又窄的身）
+        for note in list(player.active_notes) + list(player.holding_notes):
             rect_x = x + 50 + int(note.x) * 0.3
             rect_y = y + 260 - (int(note.time) - self.current_time) * 0.6
-            pygame.draw.rect(self.screen, (255, 255, 255), [rect_x, rect_y, 35, 10])
+            if note.is_long:
+                # 身：从结束时间的位置一直连到判定线（已经按住时头会缩到线下面，所以取 min）
+                end_y = y + 260 - (int(note.end_time) - self.current_time) * 0.6
+                body_bottom = min(rect_y, y + 260)
+                if body_bottom > end_y:
+                    pygame.draw.rect(self.screen, (110, 110, 110),
+                                     [rect_x + 7, end_y, 21, body_bottom - end_y])
+            # 头：滚过判定线之后就不再画了
+            if rect_y <= y + 260:
+                pygame.draw.rect(self.screen, (255, 255, 255), [rect_x, rect_y, 35, 10])
 
         # 挡板（只遮住自己这一列，遮太宽会把旁边玩家的画面涂黑）
         pygame.draw.rect(self.screen, (0, 0, 0), [x, y - 460, 240, 480])
@@ -545,7 +734,31 @@ class OsuGame:
                                           judge_color.get(judge_text, (255, 255, 255)))
         self.screen.blit(text_image, (x + 140 - t_width / 2, y + 150))
 
-        # 玩家名（刚 miss 过会闪红）
-        last_miss = max(0, 255 + 0.1 * (player.last_judge_time.get('miss', -114514) - self.current_time))
-        name_text = self.fonts[30].render(player.name, True, (255, 255 - last_miss, 255 - last_miss))
+        # 玩家名（刚 miss 过会闪红；注意颜色分量必须是 0~255 的整数，这里算出来是浮点，得取整）
+        last_miss = int(max(0.0, min(255.0,
+                        255 + 0.1 * (player.last_judge_time.get('miss', -114514) - self.current_time))))
+        name_text = self._font(30, player.name).render(player.name, True, (255, 255 - last_miss, 255 - last_miss))
         self.screen.blit(name_text, (x + 50 + 19.2, y + 260))
+
+        # 各判定的累计数量，竖排小字（队 0 贴第四轨右侧，队 1 贴第一轨左侧右对齐）
+        self._render_judgement_counts(player, x, y + 38)
+
+    def _render_judgement_counts(self, player: Player, x: int, y: int) -> None:
+        """竖排显示每个判定的累计数量。
+
+        每个判定固定占一行（顺序同 JUDGEMENTS），数量为 0 的那一行留空不画字，
+        所以红色 miss 永远落在第六行。
+        两队分列在演奏区两侧：第一队贴第四轨右侧（左对齐），第二队贴第一轨左侧（右对齐）。
+        """
+        line_height = self.count_font.get_height() + 1
+        align_right = player.team_index % 2 == 1
+        # 第四轨右边缘 = x + 50 + 448*0.3 + 35；第一轨左边缘 = x + 50 + 64*0.3
+        anchor = (x + 67) if align_right else (x + 222)
+        for index, judgement in enumerate(JUDGEMENTS):
+            count = player.judgement_counts.get(judgement, 0)
+            if count <= 0:
+                continue
+            text_image = self.count_font.render(
+                str(count), True, JUDGEMENT_COUNT_COLORS[judgement])
+            left = anchor - text_image.get_width() if align_right else anchor
+            self.screen.blit(text_image, (left, y + index * line_height))

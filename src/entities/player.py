@@ -1,19 +1,32 @@
 # src/entities/player.py
-"""模拟玩家：五项能力值 + 选手风格 + 赛中压力，每帧按概率决定这一帧能不能打中。
+"""模拟玩家：五项能力值 + 选手风格 + 赛中压力。
 
-能力值分工（全部 0~100，每首歌开始时重算）：
-    体力 stamina       决定每首歌能撑多久：体力越高，同样密度消耗越慢，后半段掉得越少
-    手速 speed         决定能从容处理多密的同键间隔（连打/交互）
-    准度 avg_accuracy  决定基础命中率；被心态按压力打折
-    稳定 consistency   决定每局手感的波动幅度，以及单帧概率的抖动大小
-    心态 mentality     决定"分数很高 / 连击很长 / 进入赛点"时准度掉多少
+判定模型：**统一的落点误差模型**。
+每个音符只结算一次（在它到点的那一帧），选手一定会去按 —— 没有"按不按键"的随机，
+只有"按下去的时刻偏了多少"：
+
+    press_offset = μ + N(0, σ)        相对音符时间的偏移，正数 = 打晚
+    σ = σ_准度 × (1 + 密度压力×k1) × (1 + 疲劳×k2) × (1 + 不稳定性×k3)
+    μ = 密度压力×k4 + 疲劳×k5
+    判定 = get_judgement(press_offset)  落在 bad 窗口内 = 打中，超出去 = 漏键
+
+所以漏键不是掷骰子掷出来的，而是"误差超出判定窗口"的结果：
+跟不上（手速不够）→ 误差被推大、整体越打越晚；累了（体力见底）→ 误差和延迟一起涨。
+准度是误差地板，只在"人人都跟得上"的低难图里才有区分度。
+
+能力分工（全部 0~100，每首歌开始时重算）：
+    手速 speed         能从容处理多密的同键间隔：跟不上时误差被放大、整体打晚
+    体力 stamina       每首歌的耐久：池子越空，落点越飘越晚，后半段开始漏
+    准度 avg_accuracy  落点误差的地板 σ（准度越高越贴近音符）
+    稳定 consistency   落点误差的抖动幅度 + 每局手感的波动幅度
+    心态 mentality     连击够长、并且体力吃紧时"手抖一下"：给落点加一个大延迟，
+                       表现为 BAD 或擦边 MISS（压力大小取自"还剩多少体力"）
 
 选手风格由名字哈希决定（同一个名字风格固定），风格会给上面五项加不同的偏置。
 """
 from __future__ import annotations
 
 import hashlib
-import math
 import random
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -36,33 +49,44 @@ ABILITY_LABELS: Dict[str, str] = {
 ABILITY_MAX = 100
 
 # 基准能力值：名字哈希在 [BASE_MIN, BASE_MAX] 上取值，再叠加风格偏置。
-# 基准是"这个选手的底子"，同一个名字每局都一样；每局的浮动只来自下面的手感（受稳定性控制）。
+# 基准是"这个选手的底子"，同一个名字每局都一样；每局的浮动只来自手感（受稳定性控制）。
 BASE_MIN = 30
 BASE_MAX = 85
 
-# ---------------- 命中模型参数 ----------------
-SPEED_GAP_MAX = 190.0     # 手速 0：同键间隔要 190ms 才算"从容"
-SPEED_GAP_MIN = 70.0      # 手速 100：70ms 就够
-SPEED_CURVE = 0.65        # 密度惩罚的曲线
-ACC_FLOOR = 0.62          # 准度 0 时的基础命中率
-ACC_GAIN = 0.40           # 准度 100 时再增加多少
-STAMINA_FLOOR = 0.70      # 体力池耗尽时的乘数
-STAMINA_DRAIN_K = 2.0     # 每次命中的体力消耗系数
-STAMINA_EFF_MIN = 0.4     # 体力 0 时的体力效率
-STAMINA_EFF_GAIN = 1.2    # 体力 100 时额外增加的效率
-STAMINA_DEMAND_REF = 250.0  # 同键间隔参考值：比它密就费体力
+# ---------------- 落点误差模型参数 ----------------
+# σ（落点误差）的各项是**相加**的，这是"低难靠准度、高难靠手速"的关键：
+#   低难图  密度压力≈0、几乎不疲劳 → σ 基本只剩准度那一项，分数被准度拉开；
+#   高难图  密度压力把 σ 顶到几十毫秒 → 准度那几毫秒的差别被淹没，手速决定谁不漏。
+SPEED_GAP_MAX = 230.0     # 手速 0：同键间隔要 230ms 才算跟得上
+SPEED_GAP_MIN = 85.0      # 手速 100：85ms 就跟得上
+DENSITY_SIGMA_ADD = 38.0     # 密度压力**平方**后每 1 单位额外增加的误差标准差（毫秒）
+DENSITY_LATENCY = 50.0       # 密度压力**平方**后每 1 单位整体打晚多少毫秒
+FATIGUE_SIGMA_ADD = 15.0     # 体力彻底见底时额外增加的误差标准差
+FATIGUE_LATENCY = 22.0       # 体力彻底见底时整体打晚多少毫秒
+CONSISTENCY_SIGMA_ADD = 3.0  # 稳定性 0 时额外增加的误差标准差（稳定性 100 时不加）
+DENSITY_EXPONENT = 2.0       # >1 把惩罚集中到"真的跟不上"的地方
+TIMING_SIGMA_MAX = 12.0   # 准度 0 时的落点误差标准差（毫秒）
+TIMING_SIGMA_MIN = 1.5    # 准度 100 时的落点误差标准差
+# 长条的"松手判定"：不吃手速（不算同键间隔、也不耗体力），但比点击更容易打偏
+LONG_RELEASE_SIGMA_SCALE = 1.8
+# 体力消耗：越密越费，体力越高越省
+STAMINA_DRAIN_K = 2.0
+STAMINA_EFF_MIN = 0.4
+STAMINA_EFF_GAIN = 1.2
+STAMINA_DEMAND_REF = 250.0
 STAMINA_DEMAND_MIN = 0.4
 STAMINA_DEMAND_MAX = 3.0
-# 打早的惩罚：只在音符前 EARLY_WINDOW_MS 之内才尝试，且提前越多越难打中。
-# 这个尺度必须远小于判定窗口，否则选手会习惯性打早，把 PERFECT 打成 GREAT/GOOD，
-# 而且"命中率越高 → 打得越早 → 判定越差"会出现反向。
-EARLY_WINDOW_MS = 55.0
-EARLY_DECAY_MS = 12.0
-CONSISTENCY_ROLL = 0.30   # 单帧概率的抖动幅度（稳定性 0 时的 ±15%）
-MENTAL_MAX_PENALTY = 0.45  # 心态 0 且压力拉满时，准度最多打 55 折
-COMBO_PRESSURE_REF = 600.0   # 连击到多少算"压力拉满"
-SCORE_PRESSURE_REF = 900000.0  # 分数（0~1000000）到多少算"压力拉满"
-MATCH_POINT_PRESSURE = 0.4
+# 心态崩盘（手抖）：连击够长、并且体力已经吃紧时才会发生。
+# 它不是"凭空漏键"，而是给落点加一个很大的延迟 —— 表现为 BAD 或擦边 MISS，
+# 具体算哪一种取决于判定窗口，改窗口不用改这里。
+CHOKE_COMBO_FLOOR = 500.0   # 连击不到 500 完全不紧张
+CHOKE_COMBO_CAP = 2000.0    # 连击到 2000 才把连击带来的紧张度拉满
+CHOKE_PER_NOTE_MAX = 0.025  # 心态 0 + 连击拉满 + 体力见底 + 压力拉满时的崩率
+CHOKE_SCORE_BOOST = 0.5     # 自己分高时的额外倍率
+CHOKE_MATCH_POINT_BOOST = 1.5  # 赛点的额外倍率
+CHOKE_LATENCY = 120.0       # 手抖时落点整体偏晚多少毫秒
+CHOKE_SIGMA = 45.0          # 手抖时的抖动幅度
+SCORE_PRESSURE_REF = 900000.0  # 分数（0~1000000）到多少算"高分"
 
 # 选手风格：名字哈希决定，风格给五项能力加偏置
 STYLES: Tuple[Tuple[str, Dict[str, int]], ...] = (
@@ -87,7 +111,7 @@ class Player:
         self.player_index = player_index
         self.judge_system = judge_system or JudgeSystem()
 
-        # 能力值：基准（名字哈希 + 抖动 + 风格）与手感偏移，每首歌开始时由 roll_abilities 重算
+        # 能力值：基准（名字哈希 + 风格）与手感偏移，每首歌开始时由 roll_abilities 重算
         self.style: str = "均衡"
         self.base_abilities: Dict[str, int] = {}
         self.ability_form: Dict[str, int] = {}
@@ -154,25 +178,41 @@ class Player:
         )
         return f"[{self.style}] {values}"
 
+    # ------------------------------------------------------------------
+    # 误差分布
+    # ------------------------------------------------------------------
     @property
-    def mental_factor(self) -> float:
-        """心态对"有效准度"的乘数：压力越大、心态越差，越接近 1-MENTAL_MAX_PENALTY。
+    def timing_sigma(self) -> float:
+        """准度决定的落点误差地板（毫秒）。"""
+        return TIMING_SIGMA_MIN + (TIMING_SIGMA_MAX - TIMING_SIGMA_MIN) * (1.0 - self.avg_accuracy / 100.0)
 
-        压力由三部分组成：连击长度、自己的分数、以及"这一局是不是赛点"。
-        前两项加起来最多 0.6，赛点再额外加 0.4 —— 这样赛点一定是明显的额外压力，
-        而不是被前两项顶到上限后看不出来。
+    @property
+    def fatigue(self) -> float:
+        """0 = 体力充沛，1 = 两只手都见底。"""
+        average = sum(self.stamina_left) / (2.0 * INITIAL_STAMINA)
+        return max(0.0, min(1.0, 1.0 - average))
+
+    @property
+    def choke_chance(self) -> float:
+        """当前这一瞬间"手抖一下"的概率。
+
+        两个前提缺一不可：
+        - 连击够长（< CHOKE_COMBO_FLOOR 时完全不紧张）；
+        - **体力已经吃紧** —— 压力大小直接取"还剩多少体力"的补数，
+          体力满的时候基本不会手抖，所以低难图（几乎不掉体力）不会莫名其妙冒漏键，
+          压力自然集中在长歌的后半段和密谱上。
+        自己分高、或者进入赛点会再放大一点。
         """
-        pressure = 0.30 * min(1.0, self.combo / COMBO_PRESSURE_REF)
-        pressure += 0.30 * min(1.0, self.std_score / SCORE_PRESSURE_REF)
+        fragility = 1.0 - self.mentality / 100.0
+        if fragility <= 0.0 or self.combo < CHOKE_COMBO_FLOOR:
+            return 0.0
+        combo_progress = min(1.0, (self.combo - CHOKE_COMBO_FLOOR)
+                             / max(1.0, CHOKE_COMBO_CAP - CHOKE_COMBO_FLOOR))
+        strain = self.fatigue   # 0 = 满体力，1 = 两手见底
+        boost = 1.0 + CHOKE_SCORE_BOOST * min(1.0, self.std_score / SCORE_PRESSURE_REF)
         if self.match_point:
-            pressure = min(1.0, pressure + MATCH_POINT_PRESSURE)
-        calm = self.mentality / 100.0
-        return 1.0 - (1.0 - calm) * pressure * MENTAL_MAX_PENALTY
-
-    @property
-    def effective_accuracy(self) -> float:
-        """被心态打折之后的准度，命中模型实际用的是这个值。"""
-        return self.avg_accuracy * self.mental_factor
+            boost += CHOKE_MATCH_POINT_BOOST
+        return CHOKE_PER_NOTE_MAX * fragility * combo_progress * strain * boost
 
     # ------------------------------------------------------------------
     # 重置
@@ -188,8 +228,11 @@ class Player:
         self.max_score: float = 1.0
 
         self.stamina_left: List[float] = [INITIAL_STAMINA, INITIAL_STAMINA]
-        self.tap_times: List[int] = [INITIAL_TAP_TIME] * TRACK_COUNT
+        # 每个键位上一个"已经结算过的音符时间"，用来算同键间隔（≈ 谱面密度）
+        self.last_note_time: List[int] = [INITIAL_TAP_TIME] * TRACK_COUNT
         self.active_notes: List[Note] = []
+        # 已经按下、还在按住的长条（等松手判定）
+        self.holding_notes: List[Note] = []
 
         self.judgement_counts: Dict[str, int] = {key: 0 for key in JUDGEMENTS}
         self.last_judgement: str = ""
@@ -206,80 +249,130 @@ class Player:
     # 每帧调用
     # ------------------------------------------------------------------
     def play(self, current_time: int) -> None:
-        """核心的游玩调用函数，游戏中每帧调用一次。
+        """每帧调用：把所有"已经到点"的音符各结算一次。
 
-        - 已经超过 miss 窗口还没打中的音符按漏掉结算（否则会永远卡在手里）
-        - 其余音符尝试击打，打不中下一帧继续试（所以越难的地方越容易打晚）
+        - 普通音符：到点结算一次点击判定，然后丢出 active_notes；
+        - 长条：到点结算一次点击判定，打中就挪进 holding_notes 继续按住，
+          到结束时间再结算一次松手判定；头都没打中的话整根就没了。
         """
-        miss_window = self.judge_system.config.miss
         for note in self.active_notes[:]:
-            if current_time - note.time > miss_window:
-                self._process_miss(note, current_time)
-                continue
-            if self._judge_if_click(axis_to_4k(note.x), note.time, current_time):
-                self._process_hit(note, current_time)
+            if note.time > current_time:
+                continue  # 还没到点，下一帧再说
+            self._resolve_note(note, current_time)
 
-    def _judge_if_click(self, track: int, tarTime: int, current_time: int) -> bool:
-        """判断这一帧能不能打中这个音符。"""
-        timedist = tarTime - current_time
-        if timedist > EARLY_WINDOW_MS:
-            return False  # 还太早，这一帧不尝试
-        tapdist = max(1, current_time - self.tap_times[track])
-        if tapdist == 1:
-            return False
+        for note in self.holding_notes[:]:
+            if current_time >= note.end_time:
+                self._resolve_release(note, current_time)
+
+    def _resolve_note(self, note: Note, current_time: int) -> None:
+        """结算一个音符的"按下"：落点误差 + 可能的手抖，再算判定。"""
+        track = axis_to_4k(note.x)
         hand = track >> 1
 
-        # 手速：这一处的同键间隔对手速来说有多从容
+        previous = self.last_note_time[track]
+        tapdist = note.time - previous
+        self.last_note_time[track] = note.time
+        self._remove_note(note)
+
+        # 先按当前体力状态出手，再结算这一下消耗掉的体力
+        press_offset = self._press_offset(tapdist) + self._choke_offset()
+        self._drain_stamina(hand, tapdist)
+
+        judgement = self.judge_system.get_judgement(press_offset)
+        if judgement == 'miss':
+            self._process_miss(note, current_time)
+        else:
+            self._process_hit(note, current_time, press_offset)
+            if note.is_long:
+                self.holding_notes.append(note)
+
+    def _resolve_release(self, note: Note, current_time: int) -> None:
+        """结算长条的"松手"：另算一次判定，不吃手速也不耗体力。"""
+        try:
+            self.holding_notes.remove(note)
+        except ValueError:
+            pass
+        release_offset = self._release_offset()
+        judgement = self.judge_system.get_judgement(release_offset)
+        if judgement == 'miss':
+            self._process_miss(note, current_time)
+        else:
+            self._process_hit(note, current_time, release_offset)
+
+    def _release_offset(self) -> float:
+        """松手判定的落点误差。
+
+        和点击判定的区别只有两条：
+        - **不吃手速**：不算同键间隔，因此没有密度压力项，也不消耗体力
+          （手速只作用于点击判定）；
+        - 更容易打偏：σ 整体乘 LONG_RELEASE_SIGMA_SCALE。
+        其余（准度地板、疲劳、稳定性）和点击判定一样。
+        """
+        fatigue = self.fatigue
+        sigma = (self.timing_sigma
+                 + FATIGUE_SIGMA_ADD * fatigue
+                 + CONSISTENCY_SIGMA_ADD * (1.0 - self.consistency / 100.0))
+        sigma *= LONG_RELEASE_SIGMA_SCALE
+        return random.gauss(FATIGUE_LATENCY * fatigue, sigma)
+
+    def _press_offset(self, tapdist: int) -> float:
+        """这一次按键相对音符时间偏了多少毫秒（正数 = 打晚）。
+
+        σ（误差大小）由准度打底，密度压力、疲劳、不稳定性各自**加上**一份；
+        μ（整体偏晚）体现"跟不上、累了会越打越晚"。
+        """
         required_gap = SPEED_GAP_MAX - (SPEED_GAP_MAX - SPEED_GAP_MIN) * (self.speed / 100.0)
-        speed_factor = min(1.0, tapdist / required_gap) ** SPEED_CURVE
+        # 略微超出能力范围只是"有点吃力"，真的差一大截才会崩：
+        # 压力取平方后，密度刚好卡在能力边缘时惩罚很小，跟不上时惩罚迅速放大
+        density_pressure = max(0.0, required_gap / max(tapdist, 25) - 1.0) ** DENSITY_EXPONENT
+        fatigue = self.fatigue
 
-        # 准度（已被心态按当前压力打折）
-        accuracy_factor = ACC_FLOOR + ACC_GAIN * (self.effective_accuracy / 100.0)
+        # σ 由准度打底，密度压力、疲劳、不稳定性各自加上一份；μ 是整体偏晚的部分。
+        # 这里没有"随机手滑"通道：准度只决定误差大小，不会突然把某个音符甩飞。
+        sigma = (self.timing_sigma
+                 + DENSITY_SIGMA_ADD * density_pressure
+                 + FATIGUE_SIGMA_ADD * fatigue
+                 + CONSISTENCY_SIGMA_ADD * (1.0 - self.consistency / 100.0))
 
-        # 体力：池子越空越吃力
-        stamina_factor = STAMINA_FLOOR + (1.0 - STAMINA_FLOOR) * (self.stamina_left[hand] / INITIAL_STAMINA)
-
-        # 稳定性：只影响这一帧概率的抖动大小，不改变平均值
-        spread = 1.0 - 0.6 * (self.consistency / 100.0)   # 稳定 0 -> 1.0，稳定 100 -> 0.4
-        roll = 1.0 + spread * (CONSISTENCY_ROLL / 2.0 - random.random() * CONSISTENCY_ROLL)
-
-        chance = accuracy_factor * speed_factor * stamina_factor * roll
-
-        # 打早了更难：越早越接近 0
-        if timedist > 0:
-            chance *= math.exp(-timedist / EARLY_DECAY_MS)
-
-        if random.random() < min(1.0, chance):
-            self._drain_stamina(hand, tapdist)
-            return True
-        return False
+        mu = DENSITY_LATENCY * density_pressure + FATIGUE_LATENCY * fatigue
+        return random.gauss(mu, sigma)
 
     def _drain_stamina(self, hand: int, tapdist: int) -> None:
-        """打中一次要花多少体力：越密越费，体力越高越省。"""
+        """打一个音符要花多少体力：越密越费，体力越高越省。"""
         demand = min(STAMINA_DEMAND_MAX,
                      max(STAMINA_DEMAND_MIN, STAMINA_DEMAND_REF / max(tapdist, 25)))
         efficiency = STAMINA_EFF_MIN + STAMINA_EFF_GAIN * (self.stamina / 100.0)
         self.stamina_left[hand] = max(
             0.0, self.stamina_left[hand] - STAMINA_DRAIN_K * demand / efficiency)
 
+    def _choke_offset(self) -> float:
+        """心态崩盘：不是凭空掉键，而是"手抖一下"——给落点加一个很大的延迟。
+
+        每个音符只结算一次，所以这里天然只会掷一次骰子。
+        """
+        chance = self.choke_chance
+        if chance <= 0.0:
+            return 0.0
+        if random.random() < chance:
+            return random.gauss(CHOKE_LATENCY, CHOKE_SIGMA)
+        return 0.0
+
     # ------------------------------------------------------------------
     # 结算
     # ------------------------------------------------------------------
-    def _process_hit(self, note: Note, current_time: int) -> Dict[str, Any]:
-        """处理一次击打，返回判定结果和分数。"""
-        time_diff = note.time - current_time
-        judgement = self.judge_system.get_judgement(time_diff)
-        self._remove_note(note)
+    def _process_hit(self, note: Note, current_time: int, press_offset: float) -> Dict[str, Any]:
+        """处理一次击打：press_offset 就是已经算好的落点偏移。"""
+        judgement = self.judge_system.get_judgement(press_offset)
         score_info = self._calculate_score(judgement)
         self._register_judgement(judgement, note, current_time)
         return {
             'judgement': judgement,
             'score': score_info['score'],
-            'time_diff': time_diff,
+            'time_diff': press_offset,
         }
 
     def _process_miss(self, note: Note, current_time: int) -> None:
-        """音符超时未打中：按 miss 结算并丢掉它。"""
+        """这个音符漏了：按 miss 结算。"""
         self._remove_note(note)
         self._calculate_score('miss')
         self._register_judgement('miss', note, current_time)
@@ -298,8 +391,6 @@ class Player:
             self.combo = 0
 
         self.judgement_counts[judgement] = self.judgement_counts.get(judgement, 0) + 1
-        if judgement != 'miss':
-            self.tap_times[axis_to_4k(note.x)] = current_time
         self.last_judge_time[judgement] = current_time
         # perfect 不覆盖上一次显示的判定，让屏幕上的判定文字自然淡出
         if judgement not in ('perfect_g', 'perfect'):
@@ -316,7 +407,7 @@ class Player:
         return {'score': self.std_score}
 
     def _update_accuracy(self) -> None:
-        """重新计算准确率。"""
+        """重新计算准确率（bad 还能续连击，所以它会明显拉低准确率但不断连）。"""
         total_hits = sum(self.judgement_counts.values())
         if total_hits > 0:
             weighted_sum = (

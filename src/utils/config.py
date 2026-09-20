@@ -68,8 +68,9 @@ class PickConfig:
 class MatchConfig:
     name: str = "MATCH"
     rounds_to_win: int = 2
-    results_file: str = "data/matchdata.txt"
-    resume: bool = False
+    resume: bool = True
+    # 已打完每一局的胜者（0/1），程序每局结束自动写回配置文件，启动时读取
+    results: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -78,9 +79,10 @@ class GameSettings:
     screen_height: int = 720
     fps: int = 60
     max_render_dist: int = 1200
-    countdown_menu: int = 5000
-    countdown_song_select: int = 5000
-    lead_in: int = 5000
+    start_delay: int = 5000        # 启动 -> 第一场比赛开始前的等待
+    song_select_delay: int = 5000  # 切到选曲页面 -> 选出本轮曲目
+    match_start_delay: int = 5000  # 选完歌 -> 比赛真正开始（音乐在这之后响起）
+    results_delay: int = 5000      # 每场打完后成绩展示时间
     debug: bool = False
 
 
@@ -98,14 +100,14 @@ class JudgeSettings:
     great: int = 45
     good: int = 60
     bad: int = 80
-    miss: int = 80
     score: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SCORES))
     bonus: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_BONUS))
     bonus_start: float = 100.0
     bonus_max: float = 100.0
 
     def windows(self) -> List[int]:
-        return [getattr(self, key) for key in JUDGEMENTS]
+        """判定窗口，从严格到宽松；超过最后一个就是 miss。"""
+        return [getattr(self, key) for key in JUDGEMENTS if key != 'miss']
 
 
 @dataclass
@@ -210,9 +212,12 @@ def _parse_game(data: Dict[str, Any]) -> GameSettings:
         screen_height=_int(sec, "screen_height", 720, "game"),
         fps=_int(sec, "fps", 60, "game"),
         max_render_dist=_int(sec, "max_render_dist", 1200, "game"),
-        countdown_menu=_int(sec, "countdown_menu", 5000, "game"),
-        countdown_song_select=_int(sec, "countdown_song_select", 5000, "game"),
-        lead_in=_int(sec, "lead_in", 5000, "game"),
+        # 前三个等待时间也接受旧名字（countdown_menu / countdown_song_select / lead_in）
+        start_delay=_int(sec, "start_delay", _int(sec, "countdown_menu", 5000, "game"), "game"),
+        song_select_delay=_int(
+            sec, "song_select_delay", _int(sec, "countdown_song_select", 5000, "game"), "game"),
+        match_start_delay=_int(sec, "match_start_delay", _int(sec, "lead_in", 5000, "game"), "game"),
+        results_delay=_int(sec, "results_delay", 5000, "game"),
         debug=_bool(sec, "debug", False, "game"),
     )
     if settings.fps <= 0:
@@ -221,6 +226,9 @@ def _parse_game(data: Dict[str, Any]) -> GameSettings:
         raise ConfigError("[game] 窗口尺寸必须大于 0")
     if settings.max_render_dist <= 0:
         raise ConfigError("[game] max_render_dist 必须大于 0")
+    for name in ("start_delay", "song_select_delay", "match_start_delay", "results_delay"):
+        if getattr(settings, name) < 0:
+            raise ConfigError(f"[game] {name} 不能是负数")
     return settings
 
 
@@ -229,12 +237,27 @@ def _parse_match(data: Dict[str, Any]) -> MatchConfig:
     cfg = MatchConfig(
         name=_text(sec, "name", "MATCH", "match"),
         rounds_to_win=_int(sec, "rounds_to_win", 2, "match"),
-        results_file=_text(sec, "results_file", "data/matchdata.txt", "match"),
-        resume=_bool(sec, "resume", False, "match"),
+        resume=_bool(sec, "resume", True, "match"),
+        results=_parse_results(sec.get("results"), "match.results"),
     )
     if cfg.rounds_to_win < 1:
         raise ConfigError("[match] rounds_to_win 至少是 1")
     return cfg
+
+
+def _parse_results(raw: Any, where: str) -> List[int]:
+    """赛果缓存：一串 0/1，每个元素是一局的胜者队序号。"""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError(f"[{where}] 必须是一个数组，例如 results = [0, 1, 0]")
+    results: List[int] = []
+    for index, item in enumerate(raw):
+        if isinstance(item, bool) or not isinstance(item, int) or item not in (0, 1):
+            raise ConfigError(f"[{where}] 第 {index + 1} 个元素必须是 0 或 1（胜者队序号），"
+                              f"实际是 {item!r}")
+        results.append(item)
+    return results
 
 
 def _parse_judge(data: Dict[str, Any]) -> JudgeSettings:
@@ -245,7 +268,6 @@ def _parse_judge(data: Dict[str, Any]) -> JudgeSettings:
         great=_int(sec, "great", 45, "judge"),
         good=_int(sec, "good", 60, "judge"),
         bad=_int(sec, "bad", 80, "judge"),
-        miss=_int(sec, "miss", 80, "judge"),
         score=_judgement_map(sec.get("score"), "judge.score", DEFAULT_SCORES),
         bonus=_judgement_map(sec.get("bonus"), "judge.bonus", DEFAULT_BONUS),
         bonus_start=_float(sec, "bonus_start", 100.0, "judge"),
@@ -256,7 +278,8 @@ def _parse_judge(data: Dict[str, Any]) -> JudgeSettings:
         raise ConfigError("[judge] 判定窗口不能是负数")
     if any(a > b for a, b in zip(windows, windows[1:])):
         raise ConfigError(
-            "[judge] 判定窗口必须从小到大：perfect_g <= perfect <= great <= good <= bad <= miss"
+            "[judge] 判定窗口必须从小到大：perfect_g <= perfect <= great <= good <= bad"
+            "（超过 bad 一律算 miss）"
         )
     if settings.bonus_max < 0:
         raise ConfigError("[judge] bonus_max 不能是负数")
@@ -382,10 +405,17 @@ def load_config(path: Optional[str] = None) -> GameConfig:
         raise ConfigError(f"找不到配置文件：{config_path}")
 
     try:
+        # 读成字节再去掉 BOM：Windows 上的记事本/PowerShell 存 UTF-8 时经常带 BOM，
+        # 而 tomllib 只接受干净文本，带 BOM 会直接报"格式错误"。
         with open(config_path, "rb") as handle:
-            data = tomllib.load(handle)
+            raw = handle.read()
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        data = tomllib.loads(raw.decode("utf-8"))
     except tomllib.TOMLDecodeError as error:
         raise ConfigError(f"配置文件格式错误（{config_path}）：{error}") from None
+    except UnicodeDecodeError as error:
+        raise ConfigError(f"配置文件不是 UTF-8 编码（{config_path}）：{error}") from None
     except OSError as error:
         raise ConfigError(f"无法读取配置文件（{config_path}）：{error}") from None
 
@@ -402,3 +432,68 @@ def load_config(path: Optional[str] = None) -> GameConfig:
         picks=_parse_picks(data, songs),
         pool_colors=_parse_pool_colors(data),
     )
+
+
+# ---------------------------------------------------------------------------
+# 把赛果写回配置文件
+# ---------------------------------------------------------------------------
+def save_match_results(config_path: str, results: List[int]) -> None:
+    """把赛果缓存写回 config.toml 里 [match] 段的 results 键。
+
+    只动这一行，注释和排版原样保留；先写临时文件再整体替换，
+    中途失败也不会把配置写坏。
+    """
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as error:
+        print(f"警告：写赛果缓存失败，读不到配置文件（{error}）")
+        return
+
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.split(newline)
+    line_text = f"results = [{', '.join(str(item) for item in results)}]"
+
+    # 1) 找到 [match] 段的范围
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip().startswith("[match]"):
+            start = index
+            break
+    if start is None:
+        print("警告：config.toml 里没有 [match] 段，赛果缓存没有写进去")
+        return
+
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        stripped = lines[index].strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            end = index
+            break
+
+    # 2) 段内已有 results = ... 就替换，否则插到该段末尾（跳过尾部空行）
+    replaced = False
+    for index in range(start + 1, end):
+        stripped = lines[index].strip()
+        if stripped.startswith("results") and stripped[len("results"):].lstrip().startswith("="):
+            lines[index] = line_text
+            replaced = True
+            break
+    if not replaced:
+        insert_at = end
+        while insert_at - 1 > start and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        lines.insert(insert_at, line_text)
+
+    # 3) 写临时文件再整体替换
+    tmp_path = f"{config_path}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(newline.join(lines))
+        os.replace(tmp_path, config_path)
+    except OSError as error:
+        print(f"警告：写赛果缓存失败（{error}）")
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass

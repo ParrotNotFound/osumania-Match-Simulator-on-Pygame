@@ -10,14 +10,15 @@ from ..utils.config import DEFAULT_BONUS, DEFAULT_SCORES, JudgeSettings
 
 @dataclass
 class JudgementConfig:
-    """判定窗口与分值配置（数值全部来自 config.toml 的 [judge] 段）"""
+    """判定窗口与分值配置（数值全部来自 config.toml 的 [judge] 段）
+
+    超过 bad 一律算 miss，所以没有单独的 miss 窗口。
+    """
     perfect_g: int = 5
     perfect: int = 25
     great: int = 45
     good: int = 60
     bad: int = 80
-    # 超过 miss 毫秒还没打中就按漏掉处理（由 Player 用来清理过期的音符）
-    miss: int = 80
     score_values: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SCORES))
     bonus_values: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_BONUS))
     bonus_start: float = 100.0
@@ -31,7 +32,6 @@ class JudgementConfig:
             great=settings.great,
             good=settings.good,
             bad=settings.bad,
-            miss=settings.miss,
             score_values=dict(settings.score),
             bonus_values=dict(settings.bonus),
             bonus_start=settings.bonus_start,

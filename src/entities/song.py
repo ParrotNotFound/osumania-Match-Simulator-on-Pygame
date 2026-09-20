@@ -20,11 +20,22 @@ AUDIO_EXTENSIONS: Tuple[str, ...] = ('.mp3', '.ogg', '.wav', '.flac', '.opus')
 
 @dataclass
 class Note:
-    """单个音符数据"""
+    """单个音符。
+
+    普通音符 type = 1，end_time = 0；
+    长条 type = 128（末位是结束时间的字段，形如 448,192,25078,128,0,26641:0:0:0:0），
+    end_time 就是那个 26641。
+    """
     x: int
     y: int
     time: int
     type: int
+    end_time: int = 0
+
+    @property
+    def is_long(self) -> bool:
+        """是不是长条（按住不放的那种）"""
+        return bool(self.type & 128) and self.end_time > self.time
 
 
 class Song:
@@ -44,6 +55,8 @@ class Song:
         self.key_count: int = 4
         self.mode: int = 3
         self.notes: List[Note] = []
+        # 总判定次数：普通音符 1 次，长条 2 次（按下一次 + 松手一次），用于算满分
+        self.judgement_count: int = 0
 
     @staticmethod
     def _resolve(path: str, root: str) -> str:
@@ -103,6 +116,7 @@ class Song:
                     self.notes.append(note)
 
         self.notes.sort(key=lambda note: note.time)
+        self.judgement_count = sum(2 if note.is_long else 1 for note in self.notes)
         if self.mode != 3:
             print(f"警告：{self.id} 的游戏模式是 {self.mode}（不是 osu!mania=3），结果可能不对")
         return True
@@ -122,11 +136,17 @@ class Song:
         if len(parts) < 4:
             return None
         try:
+            note_type = int(parts[3])
+            end_time = 0
+            # 长条：type 带 128 位，第 6 个字段形如 "26641:0:0:0:0"，冒号前就是结束时间
+            if note_type & 128 and len(parts) > 5:
+                end_time = int(parts[5].split(':')[0])
             return Note(
                 x=int(parts[0]),
                 y=int(parts[1]),
                 time=int(parts[2]),
-                type=int(parts[3]),
+                type=note_type,
+                end_time=end_time,
             )
         except ValueError:
             return None  # 忽略解析不了的行（注释、空行等）

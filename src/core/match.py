@@ -1,30 +1,36 @@
 # src/core/match.py
-"""一场比赛：两队、曲库、选曲安排、大比分与结果记录。"""
+"""一场比赛：两队、曲库、选曲安排、大比分与赛果缓存。
+
+赛果（每局一个胜者序号）直接缓存在 config.toml 的 [match] results 里：
+每局打完立刻写回，下次启动读出来接着算。
+"""
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
 from ..entities.song import Song
 from ..entities.team import Team
-from ..utils.config import PickConfig
-from ..utils.file_loader import load_results, write_results
+from ..utils.config import PickConfig, save_match_results
 from .judge import JudgeSystem
 
 
 class Match:
     def __init__(self, name: str, rounds_to_win: int = 1,
-                 results_file: str = "data/matchdata.txt",
+                 results: Optional[List[int]] = None,
+                 config_path: str = "",
                  picks: Optional[List[PickConfig]] = None,
                  judge_system: Optional[JudgeSystem] = None):
         self.name = name
         self.rounds_to_win = rounds_to_win
-        self.results_file = results_file
+        self.config_path = config_path
         self.picks: List[PickConfig] = list(picks or [])
         self.judge_system = judge_system or JudgeSystem()
 
         self.teams: List[Team] = []
         self.song_pool: List[Song] = []
         self.selected_songs: List[Dict] = []
+        # 历史赛果：每一局一个胜者序号，写回 config.toml
+        self.results: List[int] = list(results or [])
 
         self.scores: List[int] = [0, 0]  # 两队大比分
         self.current_round: int = 0      # 正在进行的这一局的序号（从 0 开始）
@@ -99,15 +105,16 @@ class Match:
             team.reroll_abilities(form_range)
 
     # ------------------------------------------------------------------
-    # 结果
+    # 结果与赛果缓存
     # ------------------------------------------------------------------
     def record_round_result(self, winning_team_index: int) -> None:
-        """记录一局结果，并检查比赛是否结束。"""
+        """记录一局结果，写回配置文件的缓存，并检查比赛是否结束。"""
         if not self.scores:
             return
         winning_team_index = max(0, min(len(self.scores) - 1, winning_team_index))
         self.scores[winning_team_index] += 1
-        write_results(self.results_file, winning_team_index)
+        self.results.append(winning_team_index)
+        self.save_results()
 
         for index, score in enumerate(self.scores):
             if score >= self.rounds_to_win:
@@ -116,23 +123,36 @@ class Match:
                 self.is_finished = True
                 break
 
-    def _load_total_results(self) -> None:
-        """从结果文件恢复大比分（resume = true 时使用）。"""
-        results = load_results(self.results_file)
+    def save_results(self) -> None:
+        """把到本场为止的全部赛果写回 config.toml 的 [match] results。"""
+        if not self.config_path:
+            return
+        save_match_results(self.config_path, self.results)
+
+    def clear_results(self) -> None:
+        """清空赛果缓存（同时写回配置文件）。"""
+        self.results = []
+        self.save_results()
+
+    def reset_progress(self) -> None:
+        """清空大比分、胜者与轮次（不动 results 缓存）。"""
         self.scores = [0] * max(2, len(self.teams))
         self.selected_songs = []
         self.current_round = 0
         self.winner = None
         self.is_finished = False
 
-        for index, winner in enumerate(results):
+    def apply_cached_results(self) -> None:
+        """按缓存里的赛果重建大比分与轮次（启动时用）。"""
+        self.reset_progress()
+        for index, winner in enumerate(self.results):
             song, team_index = self.pick_for_round(index)
             if song is not None:
                 self.select_song(song, team_index)
             if 0 <= winner < len(self.scores):
                 self.scores[winner] += 1
             else:
-                print(f"警告：比赛记录里的第 {index + 1} 行是无效的队伍序号 {winner}，已忽略")
+                print(f"警告：赛果缓存里的第 {index + 1} 条是无效的队伍序号 {winner}，已忽略")
             if any(score >= self.rounds_to_win for score in self.scores):
                 self.is_finished = True
                 break
@@ -144,9 +164,9 @@ class Match:
                     break
 
     def get_match_progress(self, load_results: bool = False) -> Dict:
-        """获取比赛进度"""
+        """获取比赛进度（load_results=True 时先按缓存重建一次）。"""
         if load_results:
-            self._load_total_results()
+            self.apply_cached_results()
         return {
             'name': self.name,
             'scores': self.scores.copy(),
