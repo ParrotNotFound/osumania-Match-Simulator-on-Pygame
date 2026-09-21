@@ -71,6 +71,11 @@ class MatchConfig:
     resume: bool = True
     # 已打完每一局的胜者（0/1），程序每局结束自动写回配置文件，启动时读取
     results: List[int] = field(default_factory=list)
+    # 计分赛模式：不管 rounds_to_win，曲库里的歌各打一遍，最后按总分排名并导出 Excel
+    score_mode: bool = False
+    excel_file: str = "data/score_match.xlsx"
+    # 常规赛果表：比赛打完把每一局双方得分写到这里（不管是不是无 UI 模式都写）
+    results_excel: str = "data/match_results.xlsx"
 
 
 @dataclass
@@ -84,6 +89,8 @@ class GameSettings:
     match_start_delay: int = 5000  # 选完歌 -> 比赛真正开始（音乐在这之后响起）
     results_delay: int = 5000      # 每场打完后成绩展示时间
     debug: bool = False
+    # 无 UI 模式：不弹窗、不渲染、不实时，用虚拟时钟尽快把比赛跑完，结果打到控制台
+    headless: bool = False
 
 
 @dataclass
@@ -219,6 +226,7 @@ def _parse_game(data: Dict[str, Any]) -> GameSettings:
         match_start_delay=_int(sec, "match_start_delay", _int(sec, "lead_in", 5000, "game"), "game"),
         results_delay=_int(sec, "results_delay", 5000, "game"),
         debug=_bool(sec, "debug", False, "game"),
+        headless=_bool(sec, "headless", False, "game"),
     )
     if settings.fps <= 0:
         raise ConfigError("[game] fps 必须大于 0")
@@ -239,6 +247,9 @@ def _parse_match(data: Dict[str, Any]) -> MatchConfig:
         rounds_to_win=_int(sec, "rounds_to_win", 2, "match"),
         resume=_bool(sec, "resume", True, "match"),
         results=_parse_results(sec.get("results"), "match.results"),
+        score_mode=_bool(sec, "score_mode", False, "match"),
+        excel_file=_text(sec, "excel_file", "data/score_match.xlsx", "match"),
+        results_excel=_text(sec, "results_excel", "data/match_results.xlsx", "match"),
     )
     if cfg.rounds_to_win < 1:
         raise ConfigError("[match] rounds_to_win 至少是 1")

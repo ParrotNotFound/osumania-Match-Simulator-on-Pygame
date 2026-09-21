@@ -18,16 +18,29 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from typing import Optional
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+def _base_dir() -> str:
+    """本程序所在目录。
+
+    打包成 exe 之后 `__file__` 指向解包出来的临时目录，配置要按 exe 自己的位置找，
+    所以这里区分一下 —— 这样 exe 拷到哪儿、旁边放不放 config.toml 都能正常工作。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+PROJECT_ROOT = _base_dir()
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.entities.player import (  # noqa: E402
-    ABILITY_KEYS, ABILITY_LABELS, BASE_MAX, BASE_MIN, SPEED_GAP_MAX, SPEED_GAP_MIN,
+    ABILITY_KEYS, ABILITY_LABELS, BASE_MAX, BASE_MIN, FORM_KEYS, SPEED_GAP_MAX, SPEED_GAP_MIN,
     STYLES, TIMING_SIGMA_MAX, TIMING_SIGMA_MIN, Player,
 )
-from src.utils.config import DEFAULT_CONFIG_NAME, ConfigError, load_config  # noqa: E402
+from src.utils.config import DEFAULT_CONFIG_NAME  # noqa: E402
 
 
 # ----------------------------------------------------------------------
@@ -44,13 +57,45 @@ def _pad(text: object, width: int, align: str = "left") -> str:
     return space + text if align == "right" else text + space
 
 
-def default_form_range() -> int:
-    """默认手感幅度取 config.toml 里 [players] 的 form_range，读不到就用 10。"""
+def _read_form_range(path: str) -> Optional[int]:
+    """从一份 TOML 里只读 [players] form_range。
+
+    刻意不走 load_config 的完整校验：分发给别人时，exe 旁边放一行
+    `[players]` + `form_range = 33` 就该生效，不该逼人家准备一整份配置。
+    """
+    import tomllib
+
     try:
-        config = load_config(os.path.join(PROJECT_ROOT, DEFAULT_CONFIG_NAME))
-        return config.players.form_range
-    except ConfigError:
-        return 10
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return None
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return None
+    players = data.get("players")
+    if not isinstance(players, dict):
+        return None
+    value = players.get("form_range")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def default_form_range() -> int:
+    """默认手感幅度取 config.toml 里 [players] 的 form_range，读不到就用 10。
+
+    先找程序旁边的 config.toml（分发给别人时可以丢一份在 exe 边上），
+    再找当前目录，都没有就用内置默认值 —— 所以不带配置也能跑。
+    """
+    for folder in (PROJECT_ROOT, os.getcwd()):
+        value = _read_form_range(os.path.join(folder, DEFAULT_CONFIG_NAME))
+        if value is not None:
+            return value
+    return 10
 
 
 def make_player(name: str, form_range: int = 0) -> Player:
@@ -88,8 +133,10 @@ def show_one(name: str, form_range: int, rolls: int) -> None:
     if form_range <= 0 or swing <= 0:
         print("  手感    ±0（没有手感波动）")
     else:
+        float_keys = "、".join(ABILITY_LABELS[key] for key in FORM_KEYS)
+        fixed_keys = "、".join(ABILITY_LABELS[key] for key in ABILITY_KEYS if key not in FORM_KEYS)
         print(f"  手感    ±{swing}（幅度由基准稳定性 {base['consistency']} 决定，"
-              f"上限 ±{form_range}）")
+              f"上限 ±{form_range}；只浮动 {float_keys}，{fixed_keys} 每局恒为基准值）")
         for index in range(max(1, rolls)):
             rolled = make_player(name, form_range)
             values = "   ".join(
@@ -162,8 +209,12 @@ def interactive(form_range: int, rolls: int) -> None:
 
 
 def main(argv=None) -> int:
+    # 输出编码：对着控制台时保持系统默认（Windows 上中文正好显示正常），
+    # 被重定向/管道接走时统一成 UTF-8 —— 这样存出来的文件编码是确定的。
     for stream in (sys.stdout, sys.stderr):
         try:
+            if not stream.isatty():
+                stream.reconfigure(encoding="utf-8")
             stream.reconfigure(errors="replace")
         except Exception:
             pass
@@ -189,6 +240,12 @@ def main(argv=None) -> int:
 
     if not args.names:
         interactive(form_range, max(1, args.rolls))
+        # 打包成 exe 双击运行时，交互模式结束后窗口会立刻关掉，留一下
+        if getattr(sys, "frozen", False):
+            try:
+                input("按回车键退出...")
+            except (EOFError, KeyboardInterrupt):
+                pass
     elif len(args.names) == 1:
         show_one(args.names[0], form_range, max(1, args.rolls))
     else:

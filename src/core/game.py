@@ -20,8 +20,15 @@ from ..entities.player import Player
 from ..entities.song import Song
 from ..entities.team import Team
 from ..utils.config import DEFAULT_POOL_COLOR, JUDGEMENTS, ConfigError, GameConfig, load_config
+from ..utils.excel import match_result_rows, score_match_rows, write_sheet
 from .judge import JudgeSystem, JudgementConfig
 from .match import Match
+
+# 无 UI 模式的推进步长（毫秒）。判定是模型自己算的，和帧步长无关，
+# 所以可以放得比 60fps 粗很多，纯粹为了跑得快。
+HEADLESS_STEP_MS = 100.0
+# 无 UI 模式的兜底：虚拟时间最多推进这么多秒还没结束就强制退出
+HEADLESS_MAX_SECONDS = 4 * 3600.0
 
 FONT_SIZES = tuple(range(20, 80, 5))
 
@@ -60,6 +67,12 @@ class OsuGame:
     def __init__(self, config: GameConfig):
         self.config = config
         self.settings = config.game
+        self.headless = bool(self.settings.headless)
+
+        # 无 UI 模式必须在 pygame.init() 之前换掉 SDL 驱动，否则窗口就已经弹出来了
+        if self.headless:
+            os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+            os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
         pygame.init()
         pygame.font.init()
@@ -72,6 +85,11 @@ class OsuGame:
             print(f"警告：音频初始化失败（{error}），本次运行将静音")
             self.audio_ok = False
 
+        if self.headless:
+            # 无 UI 模式不播音频：不然 music.get_busy() 会按真实时间走，
+            # 虚拟时钟推得再快，这一局也永远结束不了
+            self.audio_ok = False
+
         self.screen = pygame.display.set_mode(
             (self.settings.screen_width, self.settings.screen_height)
         )
@@ -80,6 +98,7 @@ class OsuGame:
         self.clock = pygame.time.Clock()
         self.fps = self.settings.fps
         self.running = False
+        self.virtual_now = 0          # 无 UI 模式的虚拟时钟（毫秒）
         self.max_render_dist = self.settings.max_render_dist
         self.pool_colors = config.pool_colors
         # 每首歌开始时按这份设置重新结算选手能力值（可在对局中热更新）
@@ -94,7 +113,14 @@ class OsuGame:
             config_path=config.path,
             picks=config.picks,
             judge_system=self.judge_system,
+            score_mode=config.match.score_mode,
         )
+        # 计分赛：成绩表写到哪、是否已经写过
+        self.excel_path = config.resolve(config.match.excel_file)
+        self.excel_written: Optional[str] = None
+        # 常规赛果表（每局双方得分）：写到哪、是否已经写过
+        self.results_excel_path = config.resolve(config.match.results_excel)
+        self.results_excel_written: Optional[str] = None
         self.current_song: Optional[Song] = None
         # 本局待发的音符（Song.notes 是谱面母本，不能被消耗，否则同一首歌第二次打就没音符了）
         self.playlist: list = []
@@ -114,9 +140,17 @@ class OsuGame:
         self._load_resources()
         self._restore_or_reset_results()
 
-        self.state_entered_at = pygame.time.get_ticks()
+        self.state_entered_at = self._now()
         if self.match.is_finished:
             self._set_state("FINISHED")
+
+    def _now(self) -> int:
+        """当前时间（毫秒）。
+
+        无 UI 模式用虚拟时钟（每轮循环往前推一帧），这样比赛能尽快跑完；
+        其余时候就是真实时钟。
+        """
+        return self.virtual_now if self.headless else pygame.time.get_ticks()
 
     # ------------------------------------------------------------------
     # 初始化
@@ -165,6 +199,17 @@ class OsuGame:
         """
         cached = list(self.match.results)
 
+        if self.match.score_mode:
+            # 计分赛的结算榜和 Excel 需要完整的逐曲成绩，没法从缓存里接着算，
+            # 所以这个模式一律重新开一场。
+            if cached:
+                print(f"提示：计分赛模式需要完整的逐曲成绩，已清空缓存里的 {len(cached)} 局赛果，"
+                      f"重新开赛")
+                self.match.clear_results()
+            print(f"提示：计分赛模式 —— 配置里的 [[picks]] 共 {len(self.match.score_tracks())} 首，"
+                  f"按顺序各打一遍，最后按总分排名并写入 {self.excel_path}")
+            return
+
         if self.config.match.resume and cached:
             self.match.apply_cached_results()
 
@@ -187,6 +232,10 @@ class OsuGame:
 
     def run(self) -> None:
         """主游戏循环"""
+        if self.headless:
+            self._run_headless()
+            return
+
         self.running = True
         while self.running:
             for event in pygame.event.get():
@@ -199,6 +248,31 @@ class OsuGame:
             self._render()
             self.clock.tick(self.fps)
 
+        pygame.quit()
+
+    def _run_headless(self) -> None:
+        """无 UI：不弹窗、不渲染、不实时，用虚拟时钟把整场比赛推完。
+
+        判定逻辑一行没改 —— 每个音符的落点误差一直是模型自己算的，
+        和"这一帧隔了多久"无关，所以把帧步长放大不会改变任何结果，
+        只是不用再等真实时间流逝。结果打到控制台，赛果表照常写到 Excel。
+        """
+        step = float(HEADLESS_STEP_MS)
+        print(f"提示：无 UI 模式，每轮按 {step:.0f}ms 的步长推进（不弹窗、不渲染、不等真实时间）")
+        self.running = True
+        frames = 0
+        limit = int(HEADLESS_MAX_SECONDS * 1000 / step)
+        while self.running:
+            self.virtual_now += step
+            self._update()
+            frames += 1
+            if self.game_state == "FINISHED":
+                break
+            if frames > limit:
+                print(f"警告：无 UI 模式推进了 {frames} 帧仍未结束（超过 "
+                      f"{HEADLESS_MAX_SECONDS}s 的比赛时长），已强制退出")
+                break
+        print(f"（无 UI 模式共推进 {frames} 帧，虚拟时间 {self.virtual_now / 1000:.0f} 秒）")
         pygame.quit()
 
     def _handle_event(self, event) -> None:
@@ -214,10 +288,10 @@ class OsuGame:
     # ------------------------------------------------------------------
     def _set_state(self, state: str) -> None:
         self.game_state = state
-        self.state_entered_at = pygame.time.get_ticks()
+        self.state_entered_at = self._now()
 
     def _state_elapsed(self) -> int:
-        return pygame.time.get_ticks() - self.state_entered_at
+        return self._now() - self.state_entered_at
 
     def _update(self) -> None:
         """更新游戏逻辑
@@ -311,8 +385,11 @@ class OsuGame:
 
         self.match.prepare_round(self.player_settings.form_range)
 
-        # 赛点：已经有队伍站在"再赢一局就赢下整场比赛"的位置
-        match_point = bool(self.match.scores) and max(self.match.scores) >= self.match.rounds_to_win - 1
+        # 赛点：已经有队伍站在"再赢一局就赢下整场比赛"的位置。
+        # 计分赛没有"再赢一局就结束"这回事（rounds_to_win 在那个模式下无效），
+        # 所以一律不算赛点，免得全场都挂着赛点压力倍率。
+        match_point = (not self.match.score_mode) and bool(self.match.scores) \
+            and max(self.match.scores) >= self.match.rounds_to_win - 1
         for team in self.match.teams:
             for player in team.players:
                 player.match_point = match_point
@@ -346,7 +423,9 @@ class OsuGame:
         """把本局每名队员的能力值打到控制台。"""
         scores = self.match.scores or [0, 0]
         print(f"\n===== 第 {round_index + 1} 局 · {song.id} {song.title} · 本局选手能力值 =====")
-        if max(scores) >= self.match.rounds_to_win - 1:
+        # 直接读选手身上的标记，不要在这里重算一遍：
+        # 计分赛不算赛点，自己重算就会印出与真实机制不符的提示
+        if any(player.match_point for team in self.match.teams for player in team.players):
             print(f"  ★ 赛点（大比分 {scores[0]}:{scores[1]}，心态差的选手会被压力影响）")
         for team in self.match.teams:
             print(f"  [{team.name}]")
@@ -367,9 +446,9 @@ class OsuGame:
         if song is not None:
             self._load_song_audio(song)
 
-        self.song_start_time = pygame.time.get_ticks() + self.settings.match_start_delay
+        self.song_start_time = self._now() + self.settings.match_start_delay
         self.current_time = -self.settings.match_start_delay
-        self.last_frame_tick = pygame.time.get_ticks()
+        self.last_frame_tick = self._now()
         self.music_started = False
         self._set_state("PLAYING")
 
@@ -381,12 +460,13 @@ class OsuGame:
         if song is None:
             return
 
-        now = pygame.time.get_ticks()
+        now = self._now()
         frame_gap = now - self.last_frame_tick
         self.last_frame_tick = now
         self.current_time = now - self.song_start_time
-        if frame_gap > 500:
+        if frame_gap > 500 and not self.headless:
             # 卡顿会让这一段时间里的音符直接过期，说一声方便排查
+            # （无 UI 模式是故意大步长推进的，不算卡顿）
             print(f"警告：对局中卡顿了 {frame_gap}ms，可能有音符被跳过")
 
         if not self.music_started:
@@ -436,8 +516,65 @@ class OsuGame:
         self.match.record_round_result(winning_team)
         self._stop_music()
         self.round_winner = self.match.teams[winning_team] if winning_team < len(self.match.teams) else None
+
+        # 每局都把双方得分和本局胜者打到控制台（无 UI 模式下这就是主要输出）
+        record = self.match.round_records[-1] if self.match.round_records else None
+        if record:
+            teams = self.match.teams
+            print(f"第 {len(self.match.round_records)} 局 {record['song_id']} "
+                  f"{record['song_title']}")
+            for index, team in enumerate(record['teams']):
+                mark = "★" if index == winning_team else " "
+                print(f"  {mark} {team['name']:<14} {team['total']:>12,.0f}")
+            if winning_team < len(teams):
+                print(f"    → {teams[winning_team].name} 拿下本局，"
+                      f"大比分 {self.match.scores[0]}:{self.match.scores[1]}")
+
+        if self.match.is_finished:
+            winner = self.match.winner.name if self.match.winner else "（无人获胜）"
+            print(f"\n比赛结束：{self.match.scores[0]}:{self.match.scores[1]}，{winner} 获胜")
+            self._write_results_excel()
+            if self.match.score_mode:
+                self._write_score_excel()
         # 玩家状态与能力值留到下一首开始时由 _prepare_players 统一重置
         self._set_state("RESULTS")
+
+    def _write_results_excel(self) -> None:
+        """比赛打完，把每一局双方得分写成 xlsx（常规赛果表，同一场只写一次）。"""
+        if self.results_excel_written or not self.match.round_records:
+            return
+        try:
+            path = write_sheet(
+                self.results_excel_path,
+                match_result_rows(self.match.round_records, self.match.scores,
+                                  self.match.winner.name if self.match.winner else ""),
+                sheet_name="赛果",
+            )
+        except OSError as error:
+            print(f"警告：写赛果 Excel 失败（{error}）")
+            return
+        self.results_excel_written = path
+        print("赛果表已写入 Excel:", path)
+
+    def _write_score_excel(self) -> None:
+        """计分赛打完后把成绩表写成 xlsx（同一场只写一次）。"""
+        if self.excel_written or not self.match.round_records:
+            return
+        try:
+            path = write_sheet(
+                self.excel_path,
+                score_match_rows(self.match.round_records, self.match.team_ranks()),
+                sheet_name=self.match.name or "成绩",
+            )
+        except OSError as error:
+            print(f"警告：写 Excel 失败（{error}）")
+            return
+        self.excel_written = path
+        totals = self.match.team_totals()
+        print("计分赛结束，成绩已写入 Excel:", path)
+        for index, team in enumerate(self.match.teams):
+            if index < len(totals):
+                print(f"  {team.name}: 总分 {totals[index]:,.1f}")
 
     # ------------------------------------------------------------------
     # 音频（没声卡时全部退化成空操作）
@@ -572,13 +709,89 @@ class OsuGame:
         self.screen.blit(text_image, (4, 4))
 
     def _render_ending(self) -> None:
-        """显示比赛结果"""
+        """显示比赛结果：计分赛看总分排名榜，普通赛看谁赢"""
+        if self.match.score_mode:
+            self._render_score_board()
+            return
         self._render_team_big_points()
-        bigfont = self._font(70, "wins")
         who_wins = f"{self.match.winner.name} wins!" if self.match.winner else "Match over"
         text_image = self._font(70, who_wins).render(who_wins, True, (255, 255, 255))
         t_width, _ = self._font(70, who_wins).size(who_wins)
         self.screen.blit(text_image, (640 - t_width / 2, 360))
+
+    def _render_score_board(self) -> None:
+        """计分赛结算榜。
+
+        中间一列是 Track1 / Track2 / ... / Total / Rank，
+        两侧各放一支队：每首歌的总分各占一行，倒数第二行是全部曲目的总分，
+        最后一行是名次。最后两行字号略大，分数千分位分隔并右对齐。
+        """
+        records = self.match.round_records
+        if not records:
+            return
+
+        totals = self.match.team_totals()
+        ranks = self.match.team_ranks()
+        labels = [f"Track{i + 1}" for i in range(len(records))] + ["Total", "Rank"]
+
+        normal_font = 45
+        big_font = 60
+        normal_height = 50
+        big_height = 72
+        top = 150
+
+        # 两侧分数列各自居中：左边半屏的中心 280，右边半屏的中心 1000
+        # （中间留给 Track/Total/Rank 这一列，大约占 560~720）
+        column_center = (280, 1000)
+
+        # 先算总高度，好把整块垂直居中
+        total_height = normal_height * (len(labels) - 2) + big_height * 2
+        y = max(top, (720 - total_height) // 2)
+
+        for row, label in enumerate(labels):
+            is_summary = row >= len(labels) - 2           # 最后两行：总分、名次
+            height = big_height if is_summary else normal_height
+            size = big_font if is_summary else normal_font
+            center_y = y + height / 2
+
+            # 中间：行标题
+            label_image = self._font(size, label).render(label, True, (200, 200, 200))
+            self.screen.blit(label_image, (640 - label_image.get_width() / 2,
+                                           center_y - label_image.get_height() / 2))
+
+            for team_index, team in enumerate(self.match.teams):
+                if is_summary and label == "Rank":
+                    text = self._ordinal(ranks[team_index])
+                elif is_summary:
+                    text = f"{totals[team_index]:,.0f}"
+                else:
+                    text = f"{records[row]['teams'][team_index]['total']:,.0f}"
+                image = self._font(size, text).render(text, True, team.color)
+                center_x = column_center[min(team_index, 1)]
+                self.screen.blit(image, (center_x - image.get_width() / 2,
+                                         center_y - image.get_height() / 2))
+
+            y += height
+
+        # 队名放两侧顶部、和各自的分数列对齐，说明哪一列是哪支队
+        for team_index, team in enumerate(self.match.teams):
+            name_image = self._font(40, team.name).render(team.name, True, team.color)
+            center_x = column_center[min(team_index, 1)]
+            self.screen.blit(name_image, (center_x - name_image.get_width() / 2, 40))
+
+        if self.excel_written:
+            hint = f"成绩表：{self.excel_written}"
+            hint_image = self._font(25, hint).render(hint, True, (140, 140, 140))
+            self.screen.blit(hint_image, (640 - hint_image.get_width() / 2, 690))
+
+    @staticmethod
+    def _ordinal(rank: int) -> str:
+        """1 -> 1st，2 -> 2nd，3 -> 3rd，11~13 用 th"""
+        if 10 <= rank % 100 <= 20:
+            suffix = "th"
+        else:
+            suffix = {1: "st", 2: "nd", 3: "rd"}.get(rank % 10, "th")
+        return f"{rank}{suffix}"
 
     def _render_team_big_points(self) -> None:
         """显示大比分"""
@@ -620,13 +833,17 @@ class OsuGame:
 
         s_width = 500
         s_height = 600 / len(songs)
-        for index, chosen in enumerate(self.match.selected_songs):
+        # 高亮"这一轮选了哪首"：行号要按曲目在曲库里的次序算，不能按第几轮算，
+        # 否则第 1 轮选 TB（曲库第 3 行）会被画到第一行上。
+        for chosen in self.match.selected_songs:
+            song = chosen["song"]
             team_index = chosen["team"]
-            if team_index >= len(self.match.teams):
+            if song not in songs or team_index >= len(self.match.teams):
                 continue
+            row = songs.index(song)
             color = self.match.teams[team_index].color
             pygame.draw.rect(self.screen, color,
-                             [640 - s_width / 2, 70 + s_height * index, s_width, s_height - 6])
+                             [640 - s_width / 2, 70 + s_height * row, s_width, s_height - 6])
 
         for index, song in enumerate(songs):
             song_key = song.id
