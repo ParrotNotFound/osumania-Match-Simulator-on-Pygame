@@ -20,7 +20,7 @@ from ..entities.player import Player
 from ..entities.song import Song
 from ..entities.team import Team
 from ..utils.config import DEFAULT_POOL_COLOR, JUDGEMENTS, ConfigError, GameConfig, load_config
-from ..utils.excel import match_result_rows, score_match_rows, write_sheet
+from ..utils.excel import append_score_match, match_result_rows, score_match_rows, write_sheet
 from .judge import JudgeSystem, JudgementConfig
 from .match import Match
 
@@ -385,6 +385,15 @@ class OsuGame:
 
         self.match.prepare_round(self.player_settings.form_range)
 
+        # 判定窗口跟着这张谱的 OD 走（lazer 的 mania 窗口曲线）。
+        # 判定系统是所有人共用的，改一次全体生效。
+        if self.config.judge.follow_chart_od:
+            self.judge_system.config.use_overall_difficulty(song.overall_difficulty)
+            judge = self.judge_system.config
+            print(f"  （判定窗口跟随谱面 OD {song.overall_difficulty:g}："
+                  f"±{judge.perfect_g:g} / {judge.perfect:g} / {judge.great:g} / "
+                  f"{judge.good:g} / {judge.bad:g} ms）")
+
         # 赛点：已经有队伍站在"再赢一局就赢下整场比赛"的位置。
         # 计分赛没有"再赢一局就结束"这回事（rounds_to_win 在那个模式下无效），
         # 所以一律不算赛点，免得全场都挂着赛点压力倍率。
@@ -557,21 +566,24 @@ class OsuGame:
         print("赛果表已写入 Excel:", path)
 
     def _write_score_excel(self) -> None:
-        """计分赛打完后把成绩表写成 xlsx（同一场只写一次）。"""
+        """计分赛打完后，把这一场的成绩**追加**到成绩表（同一场只写一次）。
+
+        追加而不是覆盖：换一支队伍再打，新成绩加在后面，之前队伍的成绩还在。
+        场次号由 append_score_match 按表里已有的最大场次 +1 算出来。
+        """
         if self.excel_written or not self.match.round_records:
             return
         try:
-            path = write_sheet(
-                self.excel_path,
-                score_match_rows(self.match.round_records, self.match.team_ranks()),
-                sheet_name=self.match.name or "成绩",
-            )
+            block = score_match_rows(self.match.round_records, self.match.team_ranks(),
+                                     self.match.name or "")
+            match_no = append_score_match(self.excel_path, block, len(self.match.round_records),
+                                          sheet_name=self.match.name or "成绩")
         except OSError as error:
             print(f"警告：写 Excel 失败（{error}）")
             return
-        self.excel_written = path
+        self.excel_written = self.excel_path
         totals = self.match.team_totals()
-        print("计分赛结束，成绩已写入 Excel:", path)
+        print(f"计分赛结束（第 {match_no} 场），成绩已追加到 Excel: {self.excel_path}")
         for index, team in enumerate(self.match.teams):
             if index < len(totals):
                 print(f"  {team.name}: 总分 {totals[index]:,.1f}")
@@ -873,8 +885,10 @@ class OsuGame:
                                     360 - 290 * min(player_index, 1))
 
         # 以下这段是显示底下那一坨分数的，老代码石山搬过来的，这段比较复杂不好动
-        score_a = teams[0].total_score
-        score_b = teams[1].total_score
+        # 屏幕上的分数用"进度线性"口径（display_score）：前 50% 大约就是 50 万，
+        # 而不是原始分那种前慢后快的 S 形。存局成绩/Excel/结算榜仍是原始分。
+        score_a = teams[0].display_score
+        score_b = teams[1].display_score
         team_color = [teams[0].color, teams[1].color]
         teamgap = math.pow(abs(score_a - score_b) * 70, 0.35) if score_a != score_b else 0
 
@@ -929,13 +943,15 @@ class OsuGame:
 
         # 分数、准确率、连击
         color = self.match.teams[player.team_index].color
-        score_text = self.fonts[35].render(f"{player.std_score:.0f}", True, (200, 200, 200))
+        # 屏幕上用"跟进度线性"的口径（见 Player.display_score）；原始分在曲终与它一致
+        shown_score = player.display_score
+        score_text = self.fonts[35].render(f"{shown_score:.0f}", True, (200, 200, 200))
         acc_text = self.fonts[35].render(f"{player.accuracy:.2f}%", True, (200, 200, 200))
         combo_text = self.fonts[40].render(str(player.combo), True, color)
 
         self.screen.blit(combo_text, (x + 140 - int(math.log10(max(1, player.combo))) * 10, y + 120))
         self.screen.blit(acc_text, (x + 180, y))
-        self.screen.blit(score_text, (x + 140 - int(math.log10(max(1, player.std_score))) * 10, y))
+        self.screen.blit(score_text, (x + 140 - int(math.log10(max(1, shown_score))) * 10, y))
 
         # 判定文字（过一会儿自动消失）
         last_time = player.last_judge_time.get(player.last_judgement, -114514)

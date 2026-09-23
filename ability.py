@@ -38,7 +38,7 @@ if PROJECT_ROOT not in sys.path:
 
 from src.entities.player import (  # noqa: E402
     ABILITY_KEYS, ABILITY_LABELS, BASE_MAX, BASE_MIN, FORM_KEYS, SPEED_GAP_MAX, SPEED_GAP_MIN,
-    STYLES, TIMING_SIGMA_MAX, TIMING_SIGMA_MIN, Player,
+    STYLES, Player, timing_sigma_for,
 )
 from src.utils.config import DEFAULT_CONFIG_NAME  # noqa: E402
 
@@ -104,8 +104,8 @@ def make_player(name: str, form_range: int = 0) -> Player:
 
 
 def sigma_of(accuracy: int) -> float:
-    """准度 → 落点误差的标准差（毫秒）。"""
-    return TIMING_SIGMA_MIN + (TIMING_SIGMA_MAX - TIMING_SIGMA_MIN) * (1.0 - accuracy / 100.0)
+    """准度 → 落点误差的标准差（毫秒）。公式在 player.py 里，和游戏用的是同一个。"""
+    return timing_sigma_for(accuracy)
 
 
 def gap_of(speed: int) -> float:

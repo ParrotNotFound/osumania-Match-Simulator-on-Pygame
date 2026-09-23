@@ -65,6 +65,10 @@ _build/wheels/
 _build/standalone/
 _build/dist/
 _build/pyinstaller*/
+# 标定/调试脚本临时写到这里的输出（表格、下载的源码副本等）
+_build/*.txt
+_build/*.log
+_build/osu_src/
 # 本机 pip 连不上索引时的临时绕法，不是项目的一部分
 _build/install_pyinstaller.py
 # 打包产物的验证脚本，属于调试工具

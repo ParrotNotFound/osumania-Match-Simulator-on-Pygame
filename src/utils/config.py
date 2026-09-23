@@ -26,13 +26,8 @@ JUDGEMENTS: Tuple[str, ...] = ("perfect_g", "perfect", "great", "good", "bad", "
 # 曲目 id 前两个字母没有配色时的兜底颜色
 DEFAULT_POOL_COLOR: Tuple[int, int, int] = (200, 200, 200)
 
-# 判定分值与连击奖励的默认值（config.toml 里可以只写想改的那几项）
-DEFAULT_SCORES: Dict[str, float] = {
-    'perfect_g': 320, 'perfect': 300, 'great': 200, 'good': 100, 'bad': 50, 'miss': 0,
-}
-DEFAULT_BONUS: Dict[str, float] = {
-    'perfect_g': 0.5, 'perfect': 0.25, 'great': 0.0, 'good': -1.0, 'bad': -3.0, 'miss': -50.0,
-}
+# 判定分值与连击奖励不再由配置控制：计分照搬 osu!lazer 的 mania 方案，
+# 权重写在 src/entities/player.py（ACCURACY_BASE / COMBO_BASE_SCORE）。
 
 
 class ConfigError(RuntimeError):
@@ -102,17 +97,17 @@ class PlayerSettings:
 
 @dataclass
 class JudgeSettings:
-    perfect_g: int = 5
-    perfect: int = 25
-    great: int = 45
-    good: int = 60
-    bad: int = 80
-    score: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SCORES))
-    bonus: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_BONUS))
-    bonus_start: float = 100.0
-    bonus_max: float = 100.0
+    """判定窗口（毫秒，半宽）。默认值是 osu!lazer 的 mania 窗口在 OD10 下的取值。"""
+    perfect_g: float = 13.5    # lazer: Perfect
+    perfect: float = 34.5      # lazer: Great
+    great: float = 67.5        # lazer: Good
+    good: float = 97.5         # lazer: Ok
+    bad: float = 121.5         # lazer: Meh
+    # true = 每张谱按自己的 OverallDifficulty 重算窗口（lazer 的 mania 窗口曲线），
+    #        上面五个值只在 false 时生效
+    follow_chart_od: bool = True
 
-    def windows(self) -> List[int]:
+    def windows(self) -> List[float]:
         """判定窗口，从严格到宽松；超过最后一个就是 miss。"""
         return [getattr(self, key) for key in JUDGEMENTS if key != 'miss']
 
@@ -209,6 +204,15 @@ def _judgement_map(raw: Any, where: str, defaults: Dict[str, float]) -> Dict[str
     return result
 
 
+def _warn_ignored_judge_keys(sec: Dict[str, Any]) -> None:
+    """老配置里的 score / bonus 表现在不生效了，说一声免得以为还在起作用。"""
+    for key in ("score", "bonus", "bonus_start", "bonus_max"):
+        if key in sec:
+            print(f"提示：[judge] {key} 已失效（计分照搬 osu!lazer 的 mania 方案），"
+                  f"可以从 config.toml 里删掉")
+            return
+
+
 # ---------------------------------------------------------------------------
 # 各段解析
 # ---------------------------------------------------------------------------
@@ -273,16 +277,14 @@ def _parse_results(raw: Any, where: str) -> List[int]:
 
 def _parse_judge(data: Dict[str, Any]) -> JudgeSettings:
     sec = _section(data, "judge")
+    _warn_ignored_judge_keys(sec)
     settings = JudgeSettings(
-        perfect_g=_int(sec, "perfect_g", 5, "judge"),
-        perfect=_int(sec, "perfect", 25, "judge"),
-        great=_int(sec, "great", 45, "judge"),
-        good=_int(sec, "good", 60, "judge"),
-        bad=_int(sec, "bad", 80, "judge"),
-        score=_judgement_map(sec.get("score"), "judge.score", DEFAULT_SCORES),
-        bonus=_judgement_map(sec.get("bonus"), "judge.bonus", DEFAULT_BONUS),
-        bonus_start=_float(sec, "bonus_start", 100.0, "judge"),
-        bonus_max=_float(sec, "bonus_max", 100.0, "judge"),
+        perfect_g=_float(sec, "perfect_g", 13.5, "judge"),
+        perfect=_float(sec, "perfect", 34.5, "judge"),
+        great=_float(sec, "great", 67.5, "judge"),
+        good=_float(sec, "good", 97.5, "judge"),
+        bad=_float(sec, "bad", 121.5, "judge"),
+        follow_chart_od=_bool(sec, "follow_chart_od", True, "judge"),
     )
     windows = settings.windows()
     if any(window < 0 for window in windows):
@@ -292,8 +294,8 @@ def _parse_judge(data: Dict[str, Any]) -> JudgeSettings:
             "[judge] 判定窗口必须从小到大：perfect_g <= perfect <= great <= good <= bad"
             "（超过 bad 一律算 miss）"
         )
-    if settings.bonus_max < 0:
-        raise ConfigError("[judge] bonus_max 不能是负数")
+    if settings.follow_chart_od:
+        print("提示：[judge] follow_chart_od = true，上面五个窗口值只在关掉它时生效")
     return settings
 
 

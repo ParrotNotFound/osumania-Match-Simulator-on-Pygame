@@ -22,8 +22,17 @@ class Team:
 
     @property
     def total_score(self) -> float:
-        """队伍总分数"""
+        """队伍总分数（lazer 原始分：赛果、Excel、结算榜都用它）"""
         return sum(player.std_score for player in self.players)
+
+    @property
+    def display_score(self) -> float:
+        """队伍总分**用于界面显示**的口径：每名队员各自的进度线性分之和。
+
+        存局成绩（`total_score`、赛果表、Excel）仍然走原始分；
+        曲终时两者相等（见 Player.display_score）。
+        """
+        return sum(player.display_score for player in self.players)
 
     @property
     def avg_accuracy(self) -> float:

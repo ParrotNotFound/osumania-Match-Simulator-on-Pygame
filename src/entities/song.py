@@ -54,6 +54,9 @@ class Song:
         self.audio_name_in_map: str = ""     # 谱面里 AudioFilename 写的文件名
         self.key_count: int = 4
         self.mode: int = 3
+        # 谱面的 OverallDifficulty（[Difficulty] 段），用来算判定窗口；
+        # 缺失时按 osu! 的惯例取 5
+        self.overall_difficulty: float = 5.0
         self.notes: List[Note] = []
         # 总判定次数：普通音符 1 次，长条 2 次（按下一次 + 松手一次），用于算满分
         self.judgement_count: int = 0
@@ -110,6 +113,9 @@ class Song:
             elif section == "[Difficulty]":
                 if stripped.startswith("CircleSize:"):
                     self.key_count = self._to_int(stripped.split(':', 1)[1], self.key_count)
+                elif stripped.startswith("OverallDifficulty:"):
+                    self.overall_difficulty = self._to_float(stripped.split(':', 1)[1],
+                                                             self.overall_difficulty)
             elif section == "[HitObjects]":
                 note = self._parse_note(stripped)
                 if note is not None:
@@ -125,6 +131,13 @@ class Song:
     def _to_int(text: str, default: int) -> int:
         try:
             return int(float(text.strip()))
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _to_float(text: str, default: float) -> float:
+        try:
+            return float(text.strip())
         except ValueError:
             return default
 

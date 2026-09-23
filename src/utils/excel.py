@@ -109,31 +109,108 @@ def _column_index(reference: str) -> int:
     return index - 1
 
 
-def read_sheet(path: str) -> List[List[Optional[str]]]:
-    """把 write_sheet 写出来的文件读回二维文本，用来校验写出的内容（Excel 里也能直接打开）。"""
+def read_rows_typed(path: str) -> List[List[Cell]]:
+    """读回表格，数值单元格还原成数字、文本还原成字符串。
+
+    追加历史成绩时必须用这个：如果按文本读回来再写出去，
+    之前那些分数就会退化成"文本格式的数字"。
+    """
     import xml.etree.ElementTree as ET
 
     namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     with zipfile.ZipFile(path) as archive:
         root = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
 
-    result: List[List[Optional[str]]] = []
+    result: List[List[Cell]] = []
     for row in root.iter(f"{namespace}row"):
-        values: List[Optional[str]] = []
+        values: List[Cell] = []
         for cell in row.iter(f"{namespace}c"):
             text = cell.find(f"{namespace}is/{namespace}t")
             if text is not None:
-                value: Optional[str] = text.text or ""
+                value: Cell = text.text or ""
             else:
                 number = cell.find(f"{namespace}v")
-                value = number.text if number is not None else ""
-            # 按单元格自己的 r 属性定位，空单元格也不会让后面的列错位
+                if number is None or number.text is None:
+                    value = ""
+                else:
+                    try:
+                        number_value = float(number.text)
+                        value = int(number_value) if number_value.is_integer() else number_value
+                    except ValueError:
+                        value = number.text
             column = _column_index(cell.get("r", ""))
             while len(values) < column:
-                values.append(None)
+                values.append("")
             values.append(value)
         result.append(values)
     return result
+
+
+def _pad_row(row: Sequence[Cell], width: int) -> List[Cell]:
+    cells = list(row)
+    while len(cells) < width:
+        cells.append("")
+    return cells[:width]
+
+
+def read_sheet(path: str) -> List[List[Optional[str]]]:
+    """把 write_sheet 写出来的文件读回二维文本，用来校验写出的内容（Excel 里也能直接打开）。"""
+    return [[None if cell is None else str(cell) for cell in row]
+            for row in read_rows_typed(path)]
+
+
+def append_score_match(path: str, block: Sequence[Sequence[Cell]], track_count: int,
+                       sheet_name: str = "成绩") -> int:
+    """把一场计分赛的成绩块**追加**到成绩表末尾（文件不存在就新建）。
+
+    这样换一支队伍再打，新成绩是加在后面，不会把之前的覆盖掉。
+    `block` 每行宽度应当是 4 + track_count + 1（场次/比赛/队伍/队员 + 各曲目 + 总分），
+    第一列留空即可，由这里统一填场次号。
+    已有的行如果比这次窄，会在曲目列补空；表头也会跟着加宽到最宽的那一场。
+    返回这场比赛的场次号（1 起）。
+    """
+    existing: List[List[Cell]] = []
+    if os.path.isfile(path):
+        try:
+            existing = read_rows_typed(path)
+        except (OSError, zipfile.BadZipFile, KeyError) as error:
+            print(f"警告：成绩表读不出来（{error}），这一场会重开一个表")
+            existing = []
+
+    header = existing[0] if existing else []
+    data_rows = existing[1:] if existing else []
+
+    # 兼容最早那版没有「场次/比赛」两列的成绩表：补上两列，整份算作第 1 场
+    legacy = bool(header) and str(header[0]) != "场次"
+    if legacy:
+        data_rows = [["", ""] + list(row) for row in data_rows]
+        print("提示：检测到旧格式的成绩表（没有场次列），已按第 1 场并入，之后继续往后追加")
+
+    # 场次号 = 已有数据里出现过的最大场次 + 1
+    numbers: List[int] = []
+    for row in data_rows:
+        try:
+            numbers.append(int(float(str(row[0]))))
+        except (IndexError, ValueError):
+            continue
+    match_no = (max(numbers) + 1) if numbers else (1 if not legacy else 2)
+
+    numbered: List[List[Cell]] = []
+    for row in block:
+        cells = list(row)
+        cells[0] = match_no
+        numbered.append(cells)
+
+    old_tracks = max(0, max((len(row) for row in data_rows), default=0) - 5)
+    width = 4 + max(track_count, old_tracks) + 1
+    new_header: List[Cell] = (["场次", "比赛", "队伍", "队员"]
+                              + [f"Track{i + 1}" for i in range(width - 5)] + ["总分"])
+
+    rows: List[List[Cell]] = [new_header]
+    rows.extend(_pad_row(row, width) for row in data_rows)
+    rows.extend(_pad_row(row, width) for row in numbered)
+    write_sheet(path, rows, sheet_name=sheet_name)
+    return match_no
 
 
 def match_result_rows(records: Sequence[dict], scores: Sequence[int],
@@ -169,19 +246,24 @@ def match_result_rows(records: Sequence[dict], scores: Sequence[int],
     return rows
 
 
-def score_match_rows(records: Sequence[dict], ranks: Sequence[int]) -> List[List[Cell]]:
-    """把计分赛的逐局记录整理成表格。
+def score_match_rows(records: Sequence[dict], ranks: Sequence[int],
+                     match_name: str = "") -> List[List[Cell]]:
+    """把一场计分赛的逐局记录整理成一个**成绩块**（不含表头，交给 append_score_match 追加）。
 
-    每支队占若干行：先每个队员一行（每首歌的分数），再来一行"队伍总分"；
-    最后一列是这名队员（或这支队伍）的合计。
+    每支队占若干行：先每个队员一行（每首歌的分数），再来一行"队伍总分"。
+    开头还有一行"曲目"，在各 Track 列里写明那一场打的是哪首歌——
+    因为成绩表是逐场累加的，没有这行就分不清第 2 场的 Track1 是哪首。
+    行的宽度 = 4（场次/比赛/队伍/队员）+ 局数 + 1（总分），第一列（场次）由追加时填。
     """
     if not records:
         return []
     track_count = len(records)
     team_count = len(records[0]["teams"])
 
-    header: List[Cell] = ["队伍", "队员"] + [f"Track{i + 1}" for i in range(track_count)] + ["总分"]
-    rows: List[List[Cell]] = [header]
+    # 曲目行：队伍列留空、队员列写"曲目"，各 Track 列写曲目 id
+    rows: List[List[Cell]] = [[
+        "", match_name, "", "曲目",
+    ] + [record.get("song_id", "") for record in records] + [""]]
 
     for team_index in range(team_count):
         first = records[0]["teams"][team_index]
@@ -189,14 +271,9 @@ def score_match_rows(records: Sequence[dict], ranks: Sequence[int]) -> List[List
         for player_index, (player_name, _) in enumerate(first["players"]):
             scores = [record["teams"][team_index]["players"][player_index][1]
                       for record in records]
-            rows.append([team_name, player_name] + scores + [round(sum(scores), 1)])
+            rows.append(["", match_name, team_name, player_name]
+                        + scores + [round(sum(scores), 1)])
         totals = [record["teams"][team_index]["total"] for record in records]
-        rows.append([team_name, f"队伍总分（第 {ranks[team_index]} 名）"]
+        rows.append(["", match_name, team_name, f"队伍总分（第 {ranks[team_index]} 名）"]
                     + totals + [round(sum(totals), 1)])
-
-    # 顺便把每首歌的歌名附在表格末尾，方便对照
-    rows.append([])
-    rows.append(["曲目", "Track", "歌名"])
-    for index, record in enumerate(records):
-        rows.append([f"Track{index + 1}", record.get("song_id", ""), record.get("song_title", "")])
     return rows

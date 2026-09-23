@@ -12,12 +12,13 @@
 
 所以漏键不是掷骰子掷出来的，而是"误差超出判定窗口"的结果：
 跟不上（手速不够）→ 误差被推大、整体越打越晚；累了（体力见底）→ 误差和延迟一起涨。
-准度是误差地板，只在"人人都跟得上"的低难图里才有区分度。
+准度是误差地板，只在"人人都跟得上"的低难图里才有区分度 —— 为了让它在**简单谱面**上也真的
+分得出高下，这一项不是线性的：见 `TIMING_SIGMA_EXPONENT`（低准度迅速变飘，高准度之间也留差距）。
 
 能力分工（全部 0~100，每首歌开始时重算）：
     手速 speed         能从容处理多密的同键间隔：跟不上时误差被放大、整体打晚
     体力 stamina       每首歌的耐久：池子越空，落点越飘越晚，后半段开始漏
-    准度 avg_accuracy  落点误差的地板 σ（准度越高越贴近音符）
+    准度 avg_accuracy  落点误差的地板 σ（准度越高越贴近音符；0→26ms、50→7.6ms、100→1.5ms）
     稳定 consistency   长条**松手**的精度 + 每局手感的波动幅度（不影响按下的精度）
     心态 mentality     连击够长、并且体力吃紧时"手抖一下"：给落点加一个大延迟，
                        表现为 BAD 或擦边 MISS（压力大小取自"还剩多少体力"）
@@ -28,6 +29,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import random
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -61,8 +63,8 @@ BASE_MAX = 85
 
 # ---------------- 落点误差模型参数 ----------------
 # σ（落点误差）的各项是**相加**的，这是"低难靠准度、高难靠手速"的关键：
-#   低难图  密度压力≈0、几乎不疲劳 → σ 基本只剩准度那一项，分数被准度拉开；
-#   高难图  密度压力把 σ 顶到几十毫秒 → 准度那几毫秒的差别被淹没，手速决定谁不漏。
+#   低难图  密度压力≈0、几乎不疲劳 → σ 基本只剩准度那一项，大 P 率被准度拉开；
+#   高难图  密度压力把 σ 顶到几十毫秒 → 准度那份的相对权重被摊薄，手速决定谁不漏。
 SPEED_GAP_MAX = 230.0     # 手速 0：同键间隔要 230ms 才算跟得上
 SPEED_GAP_MIN = 85.0      # 手速 100：85ms 就跟得上
 DENSITY_SIGMA_ADD = 38.0     # 密度压力**平方**后每 1 单位额外增加的误差标准差（毫秒）
@@ -71,8 +73,41 @@ FATIGUE_SIGMA_ADD = 15.0     # 体力彻底见底时额外增加的误差标准�
 FATIGUE_LATENCY = 22.0       # 体力彻底见底时整体打晚多少毫秒
 CONSISTENCY_SIGMA_ADD = 3.0  # 稳定性 0 时长条**松手**判定的额外 σ（只作用于松手，不作用于按下）
 DENSITY_EXPONENT = 2.0       # >1 把惩罚集中到"真的跟不上"的地方
-TIMING_SIGMA_MAX = 12.0   # 准度 0 时的落点误差标准差（毫秒）
+TIMING_SIGMA_MAX = 26.0   # 准度 0 时的落点误差标准差（毫秒）
 TIMING_SIGMA_MIN = 1.5    # 准度 100 时的落点误差标准差
+# 准度 → σ 的曲线指数：σ = MIN + (MAX − MIN) × ((100 − 准度)/100)^TIMING_SIGMA_EXPONENT。
+# 取 1 就是线性；取 >1 时中高准度之间也不会挤在一起 —— 这是"简单谱面"上准度还能比出高下的关键：
+# 线性写法下准度 40 与 80 的 σ 都远在大 P 窗口（±17~21ms）里面，大 P 率一个 96% 一个 100%，
+# 准确率只差 0.05pp，准度这项形同虚设。曲线写法把差距摊到整条曲线上。
+TIMING_SIGMA_EXPONENT = 2.0
+# 但真正麻烦的是"简单谱的高准段"：OD6.5 的大 P 窗口有 ±17ms，正态分布下 σ 只要低于 ~4ms，
+# 大 P 率就是 100.0000%。原来那条光滑曲线在准度 70 时 σ 就只剩 3.7ms，70/80/85/90/100 全被
+# 拍平在"全大 P"上 —— 高准段没有含金量，差距全挤在 20~60。
+# 所以高准段改用下面这张锚点表（分段线性插值），把 70~80 的 σ 顶起来、85 以后迅速压到地板：
+#   准度 0→26.0  40→10.3  60→5.4  70→6.2  80→5.6  90→3.2  100→1.5
+# 60 及以下与原来那条曲线完全一致（20~60 仍是主要差距区，行为不变）。
+# 注意物理天花板：大 P 与普通 P 只差 5 点权重（305 vs 300），所以哪怕大 P 率从 100% 掉到 85%，
+# 总分也只差 0.5% —— 想让高准段拉开更大，只能再动权重（ACCURACY_BASE），那是另一件事。
+TIMING_SIGMA_ANCHORS: Tuple[Tuple[float, float], ...] = (
+    (0.0, 26.0), (40.0, 10.3), (60.0, 5.4), (70.0, 6.2),
+    (80.0, 5.6), (90.0, 3.2), (100.0, 1.5),
+)
+# 「准度地板」的受力衰减：压力大的时候，精度差异不再是决定因素。
+#
+# 准度地板是一个**绝对毫秒数**（1.5~26ms），它不知道谱面有多难。难谱上体力/密度已经顶着一份
+# 很大的误差（实测 Vacant 的疲劳项均值就有 5.1ms），准度地板再以满额叠上去，σ 就会跨过 bad
+# 窗口 —— 变成"准度低的人漏键"，也就是准度跑到难谱上去决定生死了。而设计要求是：
+# **准度主要影响简单曲目里小 P（普通 P）的出现频率，不该在考验上限的谱上搅局。**
+#
+#     σ = 准度地板 × β + 密度项 + 疲劳项
+#     β = exp( -( (密度项 + 疲劳项) / TIMING_SIGMA_DAMP_K )² )
+#
+# 只压准度地板，手速（密度）和体力（疲劳）的项一个不动 —— 难谱的生死仍然交给它们。
+# 用平方指数而不是 1/(1+s/k)：中间档还要吃准度，难档要迅速失效。
+#   其它两项之和 0ms（简单谱） → β=1.00，准度满额生效
+#   1.6ms（Love!）           → β=0.75
+#   5.1ms（Vacant）          → β=0.05，准度基本退场
+TIMING_SIGMA_DAMP_K = 3.0
 # 长条的"松手判定"：不吃手速（不算同键间隔、也不耗体力），但比点击更容易打偏
 LONG_RELEASE_SIGMA_SCALE = 1.8
 # 体力消耗：越密越费，体力越高越省
@@ -98,6 +133,69 @@ CHOKE_LATENCY = 120.0       # 手抖时落点整体偏晚多少毫秒
 CHOKE_SIGMA = 45.0          # 手抖时的抖动幅度
 SCORE_PRESSURE_REF = 900000.0  # 分数（0~1000000）到多少算"高分"
 
+# ---------------- 计分：照搬 osu!lazer 的 mania 方案 ----------------
+# 源码：osu.Game.Rulesets.Mania/Scoring/ManiaScoreProcessor.cs
+#   总分 = 150000 × 连击进度
+#        + 850000 × 准度^(2 + 2×准度) × 准度进度
+#        + bonusPortion（mania 没有 bonus 判定，恒为 0）
+#   连击分增量 = 基础分 × clamp(log4(当前连击), 0.5, log4(400))
+#   准度 = Σ基础分 / (已判定次数 × 305)
+# 沿用它自己的判定权重，和本项目的五档一一对应：
+#   perfect_g↔Perfect(305)  perfect↔Great(300)  great↔Good(200)
+#   good↔Ok(100)            bad↔Meh(50)         miss↔Miss(0)
+SCORE_COMBO_PORTION = 150000.0
+SCORE_ACCURACY_PORTION = 850000.0
+COMBO_LOG_BASE = 4.0            # 连击乘数取以 4 为底的对数
+COMBO_MULT_CAP_COUNT = 400      # 连击到 400 乘数封顶（log4(400) ≈ 4.322）
+COMBO_MULT_MIN = 0.5            # 连击太少时的乘数下限
+# 计分赛成绩表里的"总分"是每首歌之和，所以上面这三段加起来就是一首歌的满分。
+SCORE_MAX_TOTAL = SCORE_COMBO_PORTION + SCORE_ACCURACY_PORTION
+
+
+def _combo_multiplier(combo: int) -> float:
+    """连击数 → 连击分乘数：clamp(log4(连击), 0.5, log4(400))。"""
+    if combo <= 0:
+        return COMBO_MULT_MIN
+    return min(max(COMBO_MULT_MIN, math.log(combo, COMBO_LOG_BASE)),
+               math.log(COMBO_MULT_CAP_COUNT, COMBO_LOG_BASE))
+
+
+def timing_sigma_for(accuracy: float) -> float:
+    """准度 → 落点误差的 σ 地板（毫秒）。
+
+    这是玩家身上**唯一**一处"由准度决定"的误差
+    （另一份是密度压力/疲劳，那是手速和体力的事）。
+
+    曲线是 `TIMING_SIGMA_ANCHORS` 那张锚点表的分段线性插值（超出两端取端点值）：
+        准度   0 → 26.0     20 → 17.2     40 → 10.3     50 → 7.6
+              60 →  5.4     70 →  6.2     80 →  5.6     90 → 3.2     100 → 1.5
+    60 及以下与原来的光滑曲线完全一致；70~80 被特意顶高（削弱中高准），85 以后迅速压到地板
+    （凸显超高准）。为什么不用一条光滑曲线：OD6.5 的大 P 窗口 ±17ms，σ 低于 ~4ms 就 100% 大 P，
+    光滑曲线在准度 70 时已经掉到 3.7ms，把 70~100 全拍平了。
+
+    游戏里（Player.timing_sigma）和独立小工具（ability.py）都走这一个函数，
+    免得两处各写一遍、改了一处忘了另一处。
+    """
+    value = max(0.0, min(100.0, float(accuracy)))
+    anchors = TIMING_SIGMA_ANCHORS
+    if value <= anchors[0][0]:
+        return anchors[0][1]
+    for (x0, y0), (x1, y1) in zip(anchors, anchors[1:]):
+        if value <= x1:
+            if x1 <= x0:
+                return y1
+            return y0 + (y1 - y0) * (value - x0) / (x1 - x0)
+    return anchors[-1][1]
+
+
+ACCURACY_BASE: Dict[str, int] = {
+    'perfect_g': 305, 'perfect': 300, 'great': 200, 'good': 100, 'bad': 50, 'miss': 0,
+}
+# 连击分用的基础分：lazer 里 Perfect(305) 在连击分里按 300 算，其余和准度权重相同
+COMBO_BASE_SCORE: Dict[str, int] = {
+    'perfect_g': 300, 'perfect': 300, 'great': 200, 'good': 100, 'bad': 50, 'miss': 0,
+}
+
 # 选手风格：名字哈希决定，风格给五项能力加偏置
 STYLES: Tuple[Tuple[str, Dict[str, int]], ...] = (
     ("均衡型", {'stamina': 6, 'speed': 6, 'avg_accuracy': 6}),
@@ -115,11 +213,15 @@ STYLE_TABLE: Tuple[int, ...] = (0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7)
 
 class Player:
     def __init__(self, name: str, team_index: int, player_index: int,
-                 judge_system: Optional[JudgeSystem] = None, form_range: int = 0):
+                 judge_system: Optional[JudgeSystem] = None, form_range: int = 0,
+                 timing_sigma_override: Optional[Tuple[float, float]] = None):
         self.name = name
         self.team_index = team_index
         self.player_index = player_index
         self.judge_system = judge_system or JudgeSystem()
+        # 只给标定脚本用：临时把 σ 地板换成别的 (上限, 曲线指数) 组合，
+        # 扫参时不用改源码常量。正常对局永远是 None。
+        self.timing_sigma_override = timing_sigma_override
 
         # 能力值：基准（名字哈希 + 风格）与手感偏移，每首歌开始时由 roll_abilities 重算
         self.style: str = "均衡"
@@ -131,6 +233,15 @@ class Player:
         self.avg_accuracy: int = 50
         self.consistency: int = 50
         self.mentality: int = 50
+
+        # 计分（lazer 口径）：本谱总判定数、以及三个"分母"
+        self.total_judgements: int = 1
+        self.maximum_base_sum: float = float(ACCURACY_BASE['perfect_g'])
+        self.maximum_combo_portion: float = (ACCURACY_BASE['perfect_g']
+                                             * math.log(COMBO_MULT_CAP_COUNT, COMBO_LOG_BASE))
+        self.accuracy_base_sum: float = 0.0
+        self.combo_portion: float = 0.0
+        self.accuracy_judged: int = 0
 
         # 赛中状态
         self.match_point: bool = False   # 本局是不是赛点（由比赛在开局时告诉选手）
@@ -195,14 +306,56 @@ class Player:
     # ------------------------------------------------------------------
     @property
     def timing_sigma(self) -> float:
-        """准度决定的落点误差地板（毫秒）。"""
-        return TIMING_SIGMA_MIN + (TIMING_SIGMA_MAX - TIMING_SIGMA_MIN) * (1.0 - self.avg_accuracy / 100.0)
+        """准度决定的落点误差地板（毫秒）：σ 随准度下降而变大（锚点表见 TIMING_SIGMA_ANCHORS）。
+
+        `timing_sigma_override` 是给标定脚本用的旁路：填 (上限, 指数) 就临时改用
+        那条光滑曲线算，不填就走正式的分段锚点表。
+        """
+        if self.timing_sigma_override is not None:
+            sigma_max, exponent = self.timing_sigma_override
+            progress = 1.0 - max(0.0, min(100.0, float(self.avg_accuracy))) / 100.0
+            return TIMING_SIGMA_MIN + (sigma_max - TIMING_SIGMA_MIN) * (progress ** exponent)
+        return timing_sigma_for(self.avg_accuracy)
 
     @property
     def fatigue(self) -> float:
         """0 = 体力充沛，1 = 两只手都见底。"""
         average = sum(self.stamina_left) / (2.0 * INITIAL_STAMINA)
         return max(0.0, min(1.0, 1.0 - average))
+
+    @property
+    def display_score(self) -> float:
+        """屏幕上那个"跟着曲目进度走"的分数（0~1000000）。
+
+        **只影响显示，不碰计分**：`score` / `std_score` 仍是 lazer 那套原始分，
+        赛果表、Excel、结算榜、控制台用的都是它。这里只给屏幕换一把尺子。
+
+        原始分是 S 形：前一半几乎不动（Science[Easy] 打到 50% 才 12 万），
+        最后四分之一涨掉一半 —— 因为 lazer 分数里的"准度项"同时带着
+        `准度^(2+2×准度)` 和"判定进度"两个因子，早期两个因子都小。
+
+        显示分改写成"两段混一混"：
+
+            display = 原始分 × 进度 + 原始分 × 进度 × 进度
+                    = 原始分 × 进度 × (1 + 进度)
+
+        第一项 `原始分 × 进度` 是**跟着速度走**的那部分（打得快分数就涨得快），
+        第二项 `原始分 × 进度²` 是"打到后面权重更大"的那部分。两项都是"原始分 × 进度"的
+        倍数，所以：
+
+        - **曲终精确回到原始分**：进度到 1 时 `1 + 进度 = 2` 抵消了系数里的 1/2，
+          显示分 == 原始分 —— 结算画面和打的时候最后一帧一致，不会跳；
+        - **前段不再趴着**：Science[Easy]（准度 70）进度 10/25/50/75/90% 时
+          原始分是 1.0/3.6/12.1/34.2/64.7（万），显示分是 9.1/19.0/28.2/38.0/60.9（万）
+          —— 第 10% 就有 9 万，而不是 1 万；50% 时已经接近 30 万；
+        - **单调不减**：原始分只增，`进度 × (1+进度)` 也只增（两者都非负）；
+        - **区分度提前**：两队分差从第 10% 就看得见，而不是憋到最后四分之一。
+        """
+        if self.score <= 0.0 or self.accuracy_judged <= 0:
+            return 0.0
+        progress = min(1.0, self.accuracy_judged / self.total_judgements)
+        display = self.score * progress * (1.0 + progress) * 0.5
+        return max(0.0, min(SCORE_MAX_TOTAL, display))
 
     @property
     def choke_chance(self) -> float:
@@ -231,7 +384,7 @@ class Player:
         return CHOKE_PER_NOTE_MAX * fragility * combo_progress * strain * boost
 
     # ------------------------------------------------------------------
-    # 重置
+    # 重置与计分准备
     # ------------------------------------------------------------------
     def reset_for_new_song(self) -> None:
         """重置每首歌的临时状态（能力值保持不变）。"""
@@ -240,8 +393,10 @@ class Player:
         self.combo: int = 0
         self.max_combo: int = 0
         self.accuracy: float = 100.0
-        self.bonus: float = self.judge_system.config.bonus_start
-        self.max_score: float = 1.0
+        # 计分用的累加量（lazer 口径），最大值在 update_maxscore 里按本谱判定数设好
+        self.accuracy_base_sum: float = 0.0
+        self.combo_portion: float = 0.0
+        self.accuracy_judged: int = 0
 
         self.stamina_left: List[float] = [INITIAL_STAMINA, INITIAL_STAMINA]
         # 每个键位上一个"已经结算过的音符时间"，用来算同键间隔（≈ 谱面密度）
@@ -260,12 +415,25 @@ class Player:
         self.last_judgement: str = ""
         # 注意要包含 '' 这个键：初始状态下 last_judgement 就是 ''，渲染时会直接查表
         self.last_judge_time: Dict[str, int] = {key: NEVER for key in ('',) + JUDGEMENTS}
+        self._update_score()
 
-    def update_maxscore(self, total_combo: int) -> None:
-        """开局时根据音符总数算出满分（用于把原始分标准化成 0~1000000）。"""
-        config = self.judge_system.config
-        per_note = config.score_values['perfect_g'] + config.bonus_max
-        self.max_score = max(1.0, float(total_combo) * per_note)
+    def update_maxscore(self, total_judgements: int) -> None:
+        """开局时告诉选手这张谱总共有多少次判定，并算好各项"满额值"。
+
+        名字沿用旧版「算满分」的叫法：lazer 方案里分数本身就是 0~1000000 的标准化值，
+        这里做的是 lazer 里 `SimulateAutoplay()` + `Reset(storeResults: true)` 那一步 ——
+        把整张谱按全 Perfect 跑一遍，得到准度满额和连击满额。
+
+        注意**满额连击分不是"每次判定都顶格乘数"**：连击乘数是从 0.5 按 log4 往上爬的，
+        满额也要走这个过程，否则全大 P 永远拿不到 100 万。
+        """
+        self.total_judgements = max(1, int(total_judgements))
+        self.maximum_base_sum = self.total_judgements * ACCURACY_BASE['perfect_g']
+        self.maximum_combo_portion = sum(
+            COMBO_BASE_SCORE['perfect_g'] * _combo_multiplier(combo)
+            for combo in range(1, self.total_judgements + 1)
+        )
+        self._update_score()
 
     # ------------------------------------------------------------------
     # 每帧调用
@@ -336,6 +504,21 @@ class Player:
         else:
             self._process_hit(note, current_time, release_offset)
 
+    def _stress_sigma(self, density_pressure: float) -> Tuple[float, float, float]:
+        """这一次结算里，除准度之外的"压力"有多大，以及准度地板要打几折。
+
+        返回 (密度项, 疲劳项, β)：
+
+        - 密度项 / 疲劳项就是 σ 里那两份（手速、体力的活），它们该多大还是多大；
+        - β 是**只作用于准度地板**的折扣：压力越大趋近 0（见 TIMING_SIGMA_DAMP_K）。
+          简单谱上其它两项≈0 → β≈1，准度满额生效（小 P 频率由它决定）；
+          难谱上体力/密度已经顶着一份大误差 → β≈0，准度不再叠加成漏键。
+        """
+        density = DENSITY_SIGMA_ADD * density_pressure
+        fatigue = FATIGUE_SIGMA_ADD * self.fatigue
+        damp = math.exp(-((density + fatigue) / TIMING_SIGMA_DAMP_K) ** 2)
+        return density, fatigue, damp
+
     def _release_offset(self) -> float:
         """松手判定的落点误差。
 
@@ -346,11 +529,12 @@ class Player:
 
         另外**只有这里吃稳定性**：长条松手是靠"撑住"的，稳不稳直接体现在这里；
         按下那一下不吃稳定性（见 `_press_offset`）。
-        准度地板和疲劳两边一样。
+        准度地板和疲劳两边一样 —— 准度地板同样按当时的压力打折（`_stress_sigma`）。
         """
         fatigue = self.fatigue
-        sigma = (self.timing_sigma
-                 + FATIGUE_SIGMA_ADD * fatigue
+        _, fatigue_sigma, damp = self._stress_sigma(0.0)
+        sigma = (self.timing_sigma * damp
+                 + fatigue_sigma
                  + CONSISTENCY_SIGMA_ADD * (1.0 - self.consistency / 100.0))
         sigma *= LONG_RELEASE_SIGMA_SCALE
         return self.rng.gauss(FATIGUE_LATENCY * fatigue, sigma)
@@ -358,9 +542,12 @@ class Player:
     def _press_offset(self, tapdist: int) -> float:
         """这一次按键相对音符时间偏了多少毫秒（正数 = 打晚）。
 
-        σ（误差大小）由准度打底，密度压力、疲劳各自**加上**一份；
+        σ（误差大小）= 准度地板（按压力打折）+ 密度压力项 + 疲劳项；
         μ（整体偏晚）体现"跟不上、累了会越打越晚"。
         稳定性不参与：它只影响长条松手的精度和每局手感幅度。
+
+        「准度地板按压力打折」是这一版的要点：它保证**准度只在"其它压力很小"的谱面上
+        才有决定权**（简单谱 → 决定小 P 频率），难谱上让位给手速和体力。
         """
         required_gap = SPEED_GAP_MAX - (SPEED_GAP_MAX - SPEED_GAP_MIN) * (self.speed / 100.0)
         # 略微超出能力范围只是"有点吃力"，真的差一大截才会崩：
@@ -368,11 +555,10 @@ class Player:
         density_pressure = max(0.0, required_gap / max(tapdist, 25) - 1.0) ** DENSITY_EXPONENT
         fatigue = self.fatigue
 
-        # σ 由准度打底，密度压力、疲劳各自加上一份；μ 是整体偏晚的部分。
+        # σ 由准度打底（受压力衰减），密度压力、疲劳各自加上一份；μ 是整体偏晚的部分。
         # 这里没有"随机手滑"通道：准度只决定误差大小，不会突然把某个音符甩飞。
-        sigma = (self.timing_sigma
-                 + DENSITY_SIGMA_ADD * density_pressure
-                 + FATIGUE_SIGMA_ADD * fatigue)
+        density_sigma, fatigue_sigma, damp = self._stress_sigma(density_pressure)
+        sigma = self.timing_sigma * damp + density_sigma + fatigue_sigma
 
         mu = DENSITY_LATENCY * density_pressure + FATIGUE_LATENCY * fatigue
         return self.rng.gauss(mu, sigma)
@@ -410,18 +596,16 @@ class Player:
     def _process_hit(self, note: Note, current_time: int, press_offset: float) -> Dict[str, Any]:
         """处理一次击打：press_offset 就是已经算好的落点偏移。"""
         judgement = self.judge_system.get_judgement(press_offset)
-        score_info = self._calculate_score(judgement)
         self._register_judgement(judgement, note, current_time)
         return {
             'judgement': judgement,
-            'score': score_info['score'],
+            'score': self.std_score,
             'time_diff': press_offset,
         }
 
     def _process_miss(self, note: Note, current_time: int) -> None:
         """这个音符漏了：按 miss 结算。"""
         self._remove_note(note)
-        self._calculate_score('miss')
         self._register_judgement('miss', note, current_time)
 
     def _remove_note(self, note: Note) -> None:
@@ -442,26 +626,83 @@ class Player:
         # perfect 不覆盖上一次显示的判定，让屏幕上的判定文字自然淡出
         if judgement not in ('perfect_g', 'perfect'):
             self.last_judgement = judgement
+        self._apply_lazer_score(judgement)
         self._update_accuracy()
 
-    def _calculate_score(self, judgement: str) -> Dict[str, float]:
-        """按判定累加原始分，并标准化成 std_score。"""
-        config = self.judge_system.config
-        self.bonus += config.bonus_values[judgement]
-        self.bonus = max(0.0, min(config.bonus_max, self.bonus))
-        self.score += config.score_values[judgement] + self.bonus
-        self.std_score = self.score * 1000000.0 / max(1.0, self.max_score)
-        return {'score': self.std_score}
+    def _apply_lazer_score(self, judgement: str) -> None:
+        """按 lazer 的 mania 口径记一次判定：累加准度基础分和连击分，然后重算总分。
+
+        连击乘数用的是"这次判定**之后**的连击数"（lazer 里是 ComboAfterJudgement），
+        所以必须在 combo 更新之后调用。
+        """
+        if judgement not in ACCURACY_BASE:
+            return
+        self.accuracy_judged += 1
+        self.accuracy_base_sum += ACCURACY_BASE[judgement]
+        self.combo_portion += COMBO_BASE_SCORE[judgement] * _combo_multiplier(self.combo)
+        self._update_score()
+
+    def _update_score(self) -> None:
+        """算出当前总分（0~1000000）—— **这是计分用的原始分，规则一点没动**。
+
+        三项都是"到目前为止拿到多少 / 总共能拿多少"，所以分数随谱面推进逐步爬到 100 万。
+        指数里那个量沿用原实现（累计基础分占比 = `accuracy_base_sum / maximum_base_sum`），
+        它是"已经打过的部分里大 P 占多少"，全 Perfect 打到一半时是 0.5。
+
+        注意这个量被 `^(2+2x)` 放大之后，早期会很小（0.5³ = 0.125），所以**原始分是 S 形**：
+        Science[Easy] 全 Perfect 打到 50% 只有 12 万。屏幕上的显示口径见 `display_score`。
+        """
+        accuracy = (self.accuracy_base_sum / self.maximum_base_sum
+                    if self.maximum_base_sum > 0 else 1.0)
+        combo_progress = (self.combo_portion / self.maximum_combo_portion
+                          if self.maximum_combo_portion > 0 else 1.0)
+        accuracy_progress = (self.accuracy_judged / self.total_judgements
+                             if self.total_judgements > 0 else 1.0)
+
+        self.score = (SCORE_COMBO_PORTION * combo_progress
+                      + SCORE_ACCURACY_PORTION
+                      * math.pow(accuracy, 2 + 2 * accuracy) * accuracy_progress)
+        self.std_score = self.score
+
+    @property
+    def display_score(self) -> float:
+        """屏幕上那个"跟着曲目进度走"的分数（0~1000000）。**只影响显示，不碰计分。**
+
+        与原始分的唯一区别是**指数里那个准确率取什么**：
+
+        - 原始分（计分用）取"累计基础分占比"，它在开局是 0、中盘大约等于进度
+          （全 Perfect 打到一半时 0.5），被 `^(2+2x)` 放大成 0.125，前段被压得极扁 ——
+          于是曲线是 S 形：50% 进度只有 12 万、最后 10% 才猛涨 35 万；
+        - 显示分取**当前平均准确率**（0~1，`self.accuracy`），它开局就是 1.0、
+          只在真的打丢时才往下掉。全 Perfect 局里它恒为 1，于是
+
+              显示分 = 150000 × 连击进度 + 850000 × 判定进度
+
+          这是**随进度线性**的：10% → 9.5 万、50% → 49.3 万、70% → 69.6 万，
+          和客户端里看到的（以及比赛录像里"70% 进度约 70% 分数"）一致。
+
+        两者在曲终等价（都等于本局的最终准确率），所以最后一帧显示的仍是真实最终分，不会跳。
+        失误照常反映：准确率掉一点，显示分就跟着落到满分线下面。
+        """
+        if self.accuracy_judged <= 0 or self.total_judgements <= 0:
+            return 0.0
+        combo_progress = (self.combo_portion / self.maximum_combo_portion
+                          if self.maximum_combo_portion > 0 else 1.0)
+        accuracy_progress = self.accuracy_judged / self.total_judgements
+        current_accuracy = min(1.0, max(0.0, self.accuracy / 100.0))
+        display = (SCORE_COMBO_PORTION * combo_progress
+                   + SCORE_ACCURACY_PORTION
+                   * math.pow(current_accuracy, 2 + 2 * current_accuracy)
+                   * accuracy_progress)
+        return max(0.0, min(SCORE_MAX_TOTAL, display))
 
     def _update_accuracy(self) -> None:
-        """重新计算准确率（bad 还能续连击，所以它会明显拉低准确率但不断连）。"""
-        total_hits = sum(self.judgement_counts.values())
-        if total_hits > 0:
-            weighted_sum = (
-                self.judgement_counts['perfect_g'] * 300 +
-                self.judgement_counts['perfect'] * 300 +
-                self.judgement_counts['great'] * 200 +
-                self.judgement_counts['good'] * 100 +
-                self.judgement_counts['bad'] * 50
-            )
-            self.accuracy = (weighted_sum / (total_hits * 300)) * 100
+        """重新计算准确率（lazer 口径：Σ基础分 / (已判定次数 × 305)）。
+
+        注意分母用的是"已判定次数"而不是总数，所以这个百分比从第一个音符起就是最终值。
+        """
+        if self.accuracy_judged <= 0:
+            self.accuracy = 100.0
+            return
+        self.accuracy = (self.accuracy_base_sum
+                         / (self.accuracy_judged * ACCURACY_BASE['perfect_g'])) * 100

@@ -23,7 +23,7 @@ debug = false                # true = 在左上角显示当前歌曲时间等调
 # --- 无 UI 比赛 ---
 # true = 不弹 pygame 窗口、不渲染、不等真实时间，用虚拟时钟尽快把整场比赛跑完，
 #        分数和赛果打到控制台（判定逻辑与正常对局完全一致，只是不再实时播放）。
-headless = true
+headless = false
 
 # --- 各阶段的等待时间（毫秒）---
 # 等待期间屏幕中央会实时显示 Countdown:xx（距离比赛真正开始的剩余秒数）
@@ -38,14 +38,14 @@ results_delay = 5000         # 每场打完后，成绩展示停留多久
 # ---------------------------------------------------------------------------
 [match]
 name = "TEST"                        # 比赛名（仅用于显示）
-rounds_to_win = 1                    # 先赢几局算赢下比赛（2 = BO3）—— 计分赛模式下无效
+rounds_to_win = 3                 # 先赢几局算赢下比赛（2 = BO3）—— 计分赛模式下无效
 # resume = true  → 启动时读取下面的 results 缓存，接着上次没打完的比赛继续
 # resume = false → 忽略并清空缓存，每次启动都重新开一场
 # （计分赛模式需要完整的逐曲成绩，所以那个模式下总是重新开一场）
 resume = true
 # 赛果缓存：每局一个胜者序号（0 = 第一支队，1 = 第二支队），每局打完自动写回这里，
 # 启动时读取。想重新开一场把它清成 [] 即可（或者把 resume 改成 false）。
-results = [1, 0, 0]
+results = [1, 0, 0, 1, 1]
 
 # --- 计分赛模式 ---
 # true = 不管 rounds_to_win，把下面 [[picks]] 里写的曲目按顺序各打一遍，
@@ -53,7 +53,7 @@ results = [1, 0, 0]
 #        结算画面也从"谁赢"换成总分排名榜。
 #        [[songs]] 是曲库（可供选曲的池子），[[picks]] 才是计分赛实际要打的曲目表；
 #        没写 [[picks]] 时会退化成打整个曲库。
-score_mode = true
+score_mode = false
 excel_file = "data/score_match.xlsx"  # 计分赛成绩表写到哪（相对路径基于本文件）
 
 # 常规赛果表：比赛打完（决出胜负）时把每一局双方得分写到这里。
@@ -65,19 +65,31 @@ results_excel = "data/match_results.xlsx"
 # 判定
 # ---------------------------------------------------------------------------
 [judge]
-# 判定窗口（毫秒），必须从小到大：perfect_g <= perfect <= great <= good <= bad
-# 超过 bad 一律算 miss（已经没有单独的 miss 窗口了）
-perfect_g = 10                # 完美+
-perfect = 35                  # 完美
-great = 55                    # 很好
-good = 75                     # 好
-bad = 100                     # 差
-# 每个判定给的基础分
-score = { perfect_g = 320, perfect = 300, great = 200, good = 100, bad = 50, miss = 0 }
-# 连击奖励的增减：bonus 初始为 bonus_start，每次判定后夹在 0 ~ bonus_max 之间
-bonus = { perfect_g = 0.5, perfect = 0.25, great = 0.0, good = -1.0, bad = -3.0, miss = -50.0 }
-bonus_start = 100
-bonus_max = 100
+# 判定窗口是否跟随谱面 OD：
+#   true  = 每张谱按自己的 OverallDifficulty 重算窗口（走 lazer 的 mania 窗口曲线：
+#           OD0/OD5/OD10 三点折线插值，再 floor(x)+0.5），下面五个固定值就不生效了
+#   false = 固定用下面这五个值
+follow_chart_od = true
+
+# 固定窗口（毫秒，半宽），必须从小到大：perfect_g <= perfect <= great <= good <= bad
+# 超过 bad 一律算 miss（没有单独的 miss 窗口）
+#
+# 下面这组是 osu!lazer 的 mania 判定窗口在 **OD10** 下的取值，
+# 五档依次对应 lazer 的 Perfect / Great / Good / Ok / Meh。
+# （源码 osu.Game.Rulesets.Mania/Scoring/ManiaHitWindows.cs 里 OD10 是
+#   13.9 / 34 / 67 / 97 / 121，lazer 会 floor(x) + 0.5，所以是下面这些 .5 的数）
+perfect_g = 13.5              # lazer: Perfect
+perfect = 34.5                # lazer: Great
+great = 67.5                  # lazer: Good
+good = 97.5                   # lazer: Ok
+bad = 121.5                   # lazer: Meh
+
+# 分值不再由这里决定 —— 计分整段照搬 osu!lazer 的 mania 方案：
+#   总分 = 150000 × 连击进度 + 850000 × 准度^(2 + 2×准度) × 准度进度
+#   连击分增量 = 基础分 × clamp(log4(当前连击), 0.5, log4(400))
+#   判定权重 = Perfect 305 / Great 300 / Good 200 / Ok 100 / Meh 50 / Miss 0
+#             （本项目的 perfect_g/perfect/great/good/bad 一一对应这五档）
+# 权重写在 src/entities/player.py 的 ACCURACY_BASE / COMBO_BASE_SCORE，改那里即可。
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +99,14 @@ bonus_max = 100
 # 只有"按下去的时刻偏了多少"的分别，误差超出判定窗口就是漏键。
 #   落点偏移 = μ + N(0, σ)
 #   σ = 准度地板 + 密度压力²×38 + 疲劳×15 + 不稳定×3   （越往上越飘）
-#   μ = 密度压力²×50 + 疲劳×22                        （跟不上、累了会越打越晚）
+#   μ =             密度压力²×50 + 疲劳×22            （跟不上、累了会越打越晚）
+#
+# 准度地板是**曲线**（不是直线）：σ = 1.5 + 24.5 × ((100 − 准度)/100)²
+#   准度  0 → 26.0ms    20 → 17.2    40 → 10.3    50 → 7.6
+#         60 →  5.4     70 →  3.7    80 →  2.5    90 → 1.7    100 → 1.5
+#   取曲线是为了让**简单谱面**上准度也能分高下：直线写法下准度 40 与 80 的 σ
+#   都远在大 P 窗口里，大 P 率一个 96% 一个 100%，准确率只差 0.05pp，等于没区别。
+#   曲线参数（TIMING_SIGMA_MAX / TIMING_SIGMA_EXPONENT）在 src/entities/player.py。
 #
 # 五项能力都是 0~100，基准由名字哈希决定 —— 同一个名字每局底子完全一样：
 #   手速 speed         能从容处理多密的同键间隔；跟不上时误差被放大、整体打晚
@@ -98,8 +117,8 @@ bonus_max = 100
 #                      压力大小取自"还剩多少体力"，所以低难图几乎不会触发
 #
 # 于是难度自然分化：
-#   低难图  密度压力≈0、也几乎不疲劳 → σ 基本只剩准度那一项 → 人人在 99% 上下比准度
-#   高难图  密度压力把 σ 顶到几十毫秒 → 准度的几毫秒差别被淹没 → 手速和耐力决定上限
+#   低难图  密度压力≈0、也几乎不疲劳 → σ 基本只剩准度那一项 → 大 P 率能从 67% 差到 100%
+#   高难图  密度压力把 σ 顶到几十毫秒 → 准度的相对权重被摊薄 → 手速和耐力决定上限
 #
 # 选手风格也由名字哈希决定（同一个名字风格固定），风格会给上面五项加偏置：
 #   均衡 / 手速型 / 耐力型 / 稳准型 / 爆发型 / 大心脏 / 赌徒 / 天才（天才 1/16 概率）
@@ -134,64 +153,64 @@ TB = [200, 200, 200]
 #  音频优先用谱面里 AudioFilename 指定的那个，再退回到 audio.mp3/.ogg/.wav）
 # ===========================================================================
 [[songs]]
-id = "RC1"                                              # 前两位是上面 pool_colors 里的分类
-title = "Lian Fan Nao Ye Rong Ru Tian Kong"
-artist = "Monster Siren Records"
-folder = "data/beatmaps/2598781"
-# beatmap = "xxx.osu"
-# audio = "audio.mp3"
-
-
+id = "RC1"    
+title = "Suisei ni Nareta nara"
+artist = "Harumaki Gohan"
+folder = "data/beatmaps/1990123 Harumaki Gohan - Suisei ni Nareta nara [no video]"
+beatmap = "Harumaki Gohan - Suisei ni Nareta nara (Chrisse) [Daydreaming].osu"
 
 [[songs]]
-id = "RC2"
-folder = "data/beatmaps/2562340 MIMI - Science (feat. Kasane Teto SV)"
-title = "Science (feat. Kasane Teto SV)"
-artist = "MIMI"
-beatmap = "MIMI - Science (feat. Kasane Teto SV) (VividCycle) [Love!].osu"
+id = "RC2"    
+title = "POSSESSION"
+artist = "TAG underground"
+folder = "data/beatmaps/2563907 TAG underground - POSSESSION"
+beatmap = "TAG underground - POSSESSION (P45ta) [Expert].osu"
 
 [[songs]]
-id = "LN1"
-title = "TESHiKANi"
-artist = "wotoha"
-folder = "data/beatmaps/2474010 wotoha - TESHiKANi"
+id = "RC3"
+title = "Hemisphere"
+artist = "ARForest"
+folder = "data/beatmaps/2582456 ARForest - Hemisphere"
 
 [[songs]]
-id = "HB1"
-title = "Ultimate Force"
-artist = "Sakuzyo"
-folder = "data/beatmaps/2318291 Sakuzyo - Ultimate Force (Game Ver.)"
-beatmap = "Sakuzyo - Ultimate Force (Game Ver.) ([TCD] Ena-suki) [ULTIMA].osu"
+id = "RC4"
+folder = "data/beatmaps/2382059 Lime - Pixel Planet"
+title = "Pixel Planet"
+artist = "Lime"
+beatmap = "Lime - Pixel Planet (Wishtynite) [Expert].osu"
 
 [[songs]]
-id = "HB2"
-title = "stresstest"
-artist = "yax03"
-folder = "data/beatmaps/2465370 yax03 - stresstest"
+id = "HB1"    
+title = "War in the Mirrorworld"
+artist = "Aoi"
+folder = "data/beatmaps/2134993 Aoi - War in the Mirrorworld"
+beatmap = "Aoi - War in the Mirrorworld ([TCD] Vani) [MEGA Lv.12].osu"
 
-#[[songs]]
-#id = "RC4"
-#title = "Hemisphere"
-#artist = "ARForest"
-#folder = "data/beatmaps/2582456 ARForest - Hemisphere"
-# 这个文件夹里有 5 个难度（Easy / Normal / Hard / Insane / Circumnavigation），
-# 按"难度名最长"取 Circumnavigation（16 字符，其余最长只有 6）
-#beatmap = "ARForest - Hemisphere (technoplanet) [Circumnavigation].osu"
+[[songs]]
+id = "HB2"    
+title = "Hotaru wa Inakatta"
+artist = "Harumaki Gohan feat. Hatsune Miku"
+folder = "data/beatmaps/2219679 Harumaki Gohan feat. Hatsune Miku - Hotaru wa Inakatta [no video]"
+beatmap = "Harumaki Gohan feat. Hatsune Miku - Hotaru wa Inakatta (c6H8o6_) [Fireflies].osu"
 
-
+[[songs]]
+id = "TB"
+folder = "data/beatmaps/755101 AA... Hisui Chazuke... - Stardust Prism"
+title = "Stardust Prism"
+artist = "AA... Hisui Chazuke..."
 # ===========================================================================
 #  队伍与玩家：必须是 2 支队伍，每队 1~3 名玩家（名字直接写在这里）
 #  玩家能力值由名字哈希生成，换个名字就是换个人
 # ===========================================================================
 [[teams]]
-name = "The Wanderers"
+name = "Red"
 color = [255, 100, 90]
-players = ["Advancer","Voyager","Uninhibited"]
+players = ["R1","R2","R3"]
 
 [[teams]]
-name = "Gamer Two"
+name = "Blue"
 color = [0, 150, 255]
-players = ["m0NESY","huNter","JKS"]
+players = ["B1","B2","B3"]
 
 
 # ===========================================================================
@@ -202,12 +221,13 @@ players = ["m0NESY","huNter","JKS"]
 # ===========================================================================
 # 曲库现在正好是这四首 RC，picks 也按同样顺序排满：第 1 局 RC1、第 2 局 RC2、第 3 局 RC3、第 4 局 RC4。
 # 注意当前 rounds_to_win = 1（BO1），普通模式下只打得到第 1 局；要四首都打一遍请把 score_mode 打开
-# （计分赛按曲库顺序各打一首，不看 picks）。
 [[picks]]
 song = "RC1"
-
 [[picks]]
 song = "HB1"
-
 [[picks]]
-song = "LN1"
+song = "HB2"
+[[picks]]
+song = "RC4"
+[[picks]]
+song = "TB"
