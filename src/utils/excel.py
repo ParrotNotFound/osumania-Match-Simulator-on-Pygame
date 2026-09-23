@@ -1,13 +1,14 @@
 # src/utils/excel.py
-"""极简 xlsx 写出：不依赖任何第三方库，直接按 OOXML 规范拼一个单表工作簿。
+"""极简 xlsx 写出：不依赖任何第三方库，直接按 OOXML 规范拼一个工作簿。
 
-.xlsx 本质上就是个 zip，最少要有这几个部件：
+.xlsx 本质上就是个 zip，最少要有这几个部件（每多一张表就多一组 sheetN）：
 
     [Content_Types].xml
     _rels/.rels
     xl/workbook.xml
     xl/_rels/workbook.xml.rels
     xl/worksheets/sheet1.xml
+    xl/worksheets/sheet2.xml ...
 
 单元格一律用 inlineStr 把文本写在单元格里，省掉 sharedStrings 那一份；
 数字写成数值单元格，打开后可以直接求和。
@@ -16,17 +17,21 @@ from __future__ import annotations
 
 import os
 import zipfile
-from typing import Any, List, Optional, Sequence, Union
+from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
 
 Cell = Union[str, int, float, None]
+# 一张表：(表名, 二维数据)
+Sheet = Tuple[str, Sequence[Sequence[Cell]]]
+
+_WORKSHEET_CONTENT_TYPE = ("application/vnd.openxmlformats-officedocument"
+                           ".spreadsheetml.worksheet+xml")
 
 _CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
 <Default Extension="xml" ContentType="application/xml"/>
 <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
-</Types>"""
+__OVERRIDES__</Types>"""
 
 _ROOT_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -35,8 +40,12 @@ _ROOT_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 _WORKBOOK_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-</Relationships>"""
+__RELATIONSHIPS__</Relationships>"""
+
+_WORKBOOK = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+             '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+             'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+             '<sheets>__SHEETS__</sheets></workbook>')
 
 
 def _escape(text: Any) -> str:
@@ -78,26 +87,69 @@ def _sheet_xml(rows: Sequence[Sequence[Cell]]) -> str:
     return "".join(parts)
 
 
-def write_sheet(path: str, rows: Sequence[Sequence[Cell]], sheet_name: str = "成绩") -> str:
-    """把二维数据写成一个 xlsx 文件，返回其绝对路径。"""
+def sheet_name_ok(name: str, used: Sequence[str] = ()) -> str:
+    """把表名收拾成 Excel 认的：去掉非法字符、最多 31 字、不重名。"""
+    text = "".join("_" if ch in "[]:*?/\\" else ch for ch in str(name)).strip() or "Sheet"
+    text = text[:31]
+    candidate = text
+    index = 2
+    while candidate in used:
+        suffix = f"({index})"
+        candidate = text[:31 - len(suffix)] + suffix
+        index += 1
+    return candidate
+
+
+def write_sheets(path: str, sheets: Iterable[Sheet]) -> str:
+    """把若干张表写进同一个 xlsx，返回其绝对路径。
+
+    `sheets` 是 (表名, 二维数据) 的序列，**第一张就是打开时默认显示的那张**。
+    只写一张表时用 write_sheet 更方便（它就是本函数的单表版本）。
+    """
+    pairs: List[Sheet] = list(sheets)
+    if not pairs:
+        raise ValueError("至少要有一张表")
+
+    names: List[str] = []
+    for name, _rows in pairs:
+        names.append(sheet_name_ok(name, names))
+
     absolute = os.path.abspath(path)
     parent = os.path.dirname(absolute)
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-    workbook = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-                f'<sheets><sheet name="{_escape(sheet_name)}" sheetId="1" r:id="rId1"/></sheets>'
-                "</workbook>")
+    overrides = "\n".join(
+        f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
+        f'ContentType="{_WORKSHEET_CONTENT_TYPE}"/>'
+        for index in range(1, len(pairs) + 1))
+    content_types = _CONTENT_TYPES.replace("__OVERRIDES__", overrides)
+
+    sheets_xml = "".join(
+        f'<sheet name="{_escape(name)}" sheetId="{index}" r:id="rId{index}"/>'
+        for index, name in enumerate(names, start=1))
+    workbook = _WORKBOOK.replace("__SHEETS__", sheets_xml)
+
+    relationships = "\n".join(
+        f'<Relationship Id="rId{index}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        f'Target="worksheets/sheet{index}.xml"/>'
+        for index in range(1, len(pairs) + 1))
+    workbook_rels = _WORKBOOK_RELS.replace("__RELATIONSHIPS__", relationships)
 
     with zipfile.ZipFile(absolute, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", _CONTENT_TYPES)
+        archive.writestr("[Content_Types].xml", content_types)
         archive.writestr("_rels/.rels", _ROOT_RELS)
         archive.writestr("xl/workbook.xml", workbook)
-        archive.writestr("xl/_rels/workbook.xml.rels", _WORKBOOK_RELS)
-        archive.writestr("xl/worksheets/sheet1.xml", _sheet_xml(rows))
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        for index, (_name, rows) in enumerate(pairs, start=1):
+            archive.writestr(f"xl/worksheets/sheet{index}.xml", _sheet_xml(rows))
     return absolute
+
+
+def write_sheet(path: str, rows: Sequence[Sequence[Cell]], sheet_name: str = "成绩") -> str:
+    """把二维数据写成一个单表 xlsx 文件，返回其绝对路径。"""
+    return write_sheets(path, [(sheet_name, rows)])
 
 
 def _column_index(reference: str) -> int:
@@ -109,17 +161,20 @@ def _column_index(reference: str) -> int:
     return index - 1
 
 
-def read_rows_typed(path: str) -> List[List[Cell]]:
+def read_rows_typed(path: str, sheet: int = 1) -> List[List[Cell]]:
     """读回表格，数值单元格还原成数字、文本还原成字符串。
 
     追加历史成绩时必须用这个：如果按文本读回来再写出去，
     之前那些分数就会退化成"文本格式的数字"。
+    `sheet` 是第几张表（1 起，和 write_sheets 里的顺序一致）。
     """
     import xml.etree.ElementTree as ET
 
+    if sheet < 1:
+        raise ValueError("sheet 从 1 开始数")
     namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     with zipfile.ZipFile(path) as archive:
-        root = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+        root = ET.fromstring(archive.read(f"xl/worksheets/sheet{sheet}.xml"))
 
     result: List[List[Cell]] = []
     for row in root.iter(f"{namespace}row"):
@@ -153,10 +208,10 @@ def _pad_row(row: Sequence[Cell], width: int) -> List[Cell]:
     return cells[:width]
 
 
-def read_sheet(path: str) -> List[List[Optional[str]]]:
-    """把 write_sheet 写出来的文件读回二维文本，用来校验写出的内容（Excel 里也能直接打开）。"""
+def read_sheet(path: str, sheet: int = 1) -> List[List[Optional[str]]]:
+    """把 write_sheet(s) 写出来的文件读回二维文本，用来校验写出的内容（Excel 里也能直接打开）。"""
     return [[None if cell is None else str(cell) for cell in row]
-            for row in read_rows_typed(path)]
+            for row in read_rows_typed(path, sheet=sheet)]
 
 
 def append_score_match(path: str, block: Sequence[Sequence[Cell]], track_count: int,

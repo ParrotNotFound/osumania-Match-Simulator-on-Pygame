@@ -79,10 +79,19 @@ class GameSettings:
     screen_height: int = 720
     fps: int = 60
     max_render_dist: int = 1200
-    start_delay: int = 5000        # 启动 -> 第一场比赛开始前的等待
-    song_select_delay: int = 5000  # 切到选曲页面 -> 选出本轮曲目
-    match_start_delay: int = 5000  # 选完歌 -> 比赛真正开始（音乐在这之后响起）
-    results_delay: int = 5000      # 每场打完后成绩展示时间
+    # 各阶段时长（毫秒）：
+    #   start_delay        启动后停在选曲页、放 prelude_song（第一首宣布之前）
+    #   song_select_delay  选曲页上"还没点出下一首"的时间，继续放刚打完的那首
+    #   match_start_delay  选曲页上"点出下一首并试听"的时间
+    #   preroll_delay      切到游玩页面后、谱面开始滚之前的固定等待
+    #   results_delay      每场打完后成绩展示时间
+    start_delay: int = 5000
+    song_select_delay: int = 5000
+    match_start_delay: int = 5000
+    preroll_delay: int = 1000
+    # start_delay 期间放什么：写曲库里的 id 就放那一首；留空则放"这场的第 1 首"
+    prelude_song: str = ""
+    results_delay: int = 5000
     debug: bool = False
     # 无 UI 模式：不弹窗、不渲染、不实时，用虚拟时钟尽快把比赛跑完，结果打到控制台
     headless: bool = False
@@ -228,6 +237,8 @@ def _parse_game(data: Dict[str, Any]) -> GameSettings:
         song_select_delay=_int(
             sec, "song_select_delay", _int(sec, "countdown_song_select", 5000, "game"), "game"),
         match_start_delay=_int(sec, "match_start_delay", _int(sec, "lead_in", 5000, "game"), "game"),
+        preroll_delay=_int(sec, "preroll_delay", 1000, "game"),
+        prelude_song=_text(sec, "prelude_song", "", "game"),
         results_delay=_int(sec, "results_delay", 5000, "game"),
         debug=_bool(sec, "debug", False, "game"),
         headless=_bool(sec, "headless", False, "game"),
@@ -238,7 +249,8 @@ def _parse_game(data: Dict[str, Any]) -> GameSettings:
         raise ConfigError("[game] 窗口尺寸必须大于 0")
     if settings.max_render_dist <= 0:
         raise ConfigError("[game] max_render_dist 必须大于 0")
-    for name in ("start_delay", "song_select_delay", "match_start_delay", "results_delay"):
+    for name in ("start_delay", "song_select_delay", "match_start_delay",
+                 "preroll_delay", "results_delay"):
         if getattr(settings, name) < 0:
             raise ConfigError(f"[game] {name} 不能是负数")
     return settings

@@ -4,6 +4,12 @@
 
 不依赖 pygame、不启动游戏、不读音频 —— 只走谱面的纯文本解析。
 
+写出的 Excel 有两张表：
+    sheet1「赛谱分析」  完整指标 + 表尾口径说明
+    sheet2「难度总览」  只有最关心的 12 列（曲目/标题/标题原文/作曲者/时长/音符数/
+                        长条数/长条占比/手速要求/最快5%段手速/体力要求/体力50终盘剩余），
+                        没有任何说明行，方便直接拿去排序对比
+
 "手速/体力要求"不是拍脑袋定的，而是**反推**主程序那套落点误差模型算出来的：
 常量直接从 src/entities/player.py import，主程序调模型时这份报告会自动跟着变，
 不会出现两边对不上的情况。
@@ -33,7 +39,7 @@ from src.entities.player import (  # noqa: E402
 from src.entities.song import Song  # noqa: E402
 from src.utils.axis_to_track import axis_to_4k  # noqa: E402
 from src.utils.config import DEFAULT_CONFIG_NAME, ConfigError, load_config  # noqa: E402
-from src.utils.excel import write_sheet  # noqa: E402
+from src.utils.excel import write_sheets  # noqa: E402
 
 DEFAULT_OUTPUT = "data/chart_report.xlsx"
 DEFAULT_FREE = 0.05     # 平均密度压力降到这个值以下算"跟得上"
@@ -208,6 +214,42 @@ def stamina_requirement(distances: Sequence[float], rests: Sequence[float],
     return round(high, 1)
 
 
+def read_metadata(beatmap_path: Optional[str]) -> Dict[str, str]:
+    """读 .osu 的 [Metadata] 段，取出"标题原文"和"作曲者"。
+
+    标题原文：优先 TitleUnicode，没有就退回 Title —— config.toml 里的 title 是
+    给人看的显示名（经常是拉丁字母转写），TitleUnicode 才是原作者写的原文。
+    作曲者就是 osu! 的 Artist 字段（不是谱师 Creator）。
+    谱面读不出来时两项都返回空串，由调用方决定退回到什么。
+    """
+    title_unicode = ""
+    title_ascii = ""
+    artist = ""
+    if not beatmap_path:
+        return {"title_original": "", "artist": ""}
+    try:
+        with open(beatmap_path, "r", encoding="utf-8-sig", errors="replace") as handle:
+            section = ""
+            for line in handle:
+                stripped = line.strip()
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    if section == "[Metadata]":     # 元数据只有开头一段，读完就走
+                        break
+                    section = stripped
+                    continue
+                if section != "[Metadata]":
+                    continue
+                if stripped.startswith("TitleUnicode:"):
+                    title_unicode = stripped.split(":", 1)[1].strip()
+                elif stripped.startswith("Title:"):
+                    title_ascii = stripped.split(":", 1)[1].strip()
+                elif stripped.startswith("Artist:"):
+                    artist = stripped.split(":", 1)[1].strip()
+    except OSError:
+        return {"title_original": "", "artist": ""}
+    return {"title_original": title_unicode or title_ascii, "artist": artist}
+
+
 def analyze(song: Song, free: float, keep: float) -> Dict:
     """算一首谱的全部指标。"""
     notes = song.notes
@@ -215,6 +257,7 @@ def analyze(song: Song, free: float, keep: float) -> Dict:
     rests = collect_hand_rests(song)
     tracks = [axis_to_4k(note.x) for note in notes]
     hands = [track >> 1 for track in tracks]
+    metadata = read_metadata(song.beatmap_path)
 
     long_notes = [note for note in notes if note.is_long]
     long_lengths = [note.end_time - note.time for note in long_notes]
@@ -242,6 +285,9 @@ def analyze(song: Song, free: float, keep: float) -> Dict:
     return {
         'id': song.id,
         'title': song.title,
+        'title_original': metadata['title_original'],
+        # 作曲者以谱面里的 Artist 为准；谱面没写就退回 config.toml 的 artist
+        'artist': metadata['artist'] or song.artist,
         'duration': duration,
         'notes': len(notes),
         'longs': len(long_notes),
@@ -284,6 +330,25 @@ def to_rows(results: Sequence[Dict]) -> List[List]:
             item['speed_req'], item['speed_req_fast'], item['speed_req_dense'],
             round(item['stamina_req'], 1), round(item['stamina_left_at_50'], 1),
             item['error'],
+        ])
+    return rows
+
+
+# sheet2「难度总览」只留最关心的 12 列，不带任何说明行
+SUMMARY_HEADERS = ["曲目", "标题", "标题原文", "作曲者", "时长(s)", "音符数", "长条数",
+                   "长条占比(%)", "手速要求", "最快5%段手速", "体力要求",
+                   "体力50终盘剩余(%)"]
+
+
+def summary_rows(results: Sequence[Dict]) -> List[List]:
+    """sheet2：从完整结果里挑出最关心的几列，表头 + 数据，到此为止。"""
+    rows: List[List] = [list(SUMMARY_HEADERS)]
+    for item in results:
+        rows.append([
+            item['id'], item['title'], item['title_original'], item['artist'],
+            round(item['duration'], 1), item['notes'], item['longs'],
+            round(item['long_ratio'], 1), item['speed_req'], item['speed_req_fast'],
+            round(item['stamina_req'], 1), round(item['stamina_left_at_50'], 1),
         ])
     return rows
 
@@ -398,11 +463,13 @@ def main(argv=None) -> int:
         if not ok or not song.notes:
             results.append({
                 'id': song_config.id, 'title': song_config.title or song_config.id,
+                'title_original': "", 'artist': song_config.artist,
                 'duration': 0.0, 'notes': 0, 'longs': 0, 'long_ratio': 0.0,
                 'long_avg': 0.0, 'nps_median': 0.0, 'nps_peak': 0,
                 'gap_p10': 0.0, 'gap_median': 0.0, 'gap_p90': 0.0,
-                'speed_req': 0, 'speed_req_dense': 0, 'stamina_req': 0.0,
-                'stamina_left_at_50': 0.0, 'speed_saturated': False,
+                'speed_req': 0, 'speed_req_fast': 0, 'speed_req_dense': 0,
+                'stamina_req': 0.0, 'stamina_left_at_50': 0.0,
+                'speed_saturated': False, 'fast_saturated': False,
                 'error': "谱面读不出来或没有音符",
             })
             continue
@@ -414,15 +481,17 @@ def main(argv=None) -> int:
     print_table(results)
 
     if not args.no_excel:
+        target = (os.path.join(config.root, args.output)
+                  if not os.path.isabs(args.output) else args.output)
         try:
-            path = write_sheet(os.path.join(config.root, args.output)
-                               if not os.path.isabs(args.output) else args.output,
-                               to_rows(results) + notes_rows(args.free, args.keep),
-                               sheet_name="赛谱分析")
+            path = write_sheets(target, [
+                ("赛谱分析", to_rows(results) + notes_rows(args.free, args.keep)),
+                ("难度总览", summary_rows(results)),
+            ])
         except OSError as error:
             print(f"写 Excel 失败：{error}")
             return 1
-        print(f"\n已写入 Excel：{path}")
+        print(f"\n已写入 Excel：{path}（sheet1 赛谱分析 / sheet2 难度总览）")
     return 0
 
 

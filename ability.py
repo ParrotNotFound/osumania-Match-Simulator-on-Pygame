@@ -38,7 +38,7 @@ if PROJECT_ROOT not in sys.path:
 
 from src.entities.player import (  # noqa: E402
     ABILITY_KEYS, ABILITY_LABELS, BASE_MAX, BASE_MIN, FORM_KEYS, SPEED_GAP_MAX, SPEED_GAP_MIN,
-    STYLES, Player, timing_sigma_for,
+    STYLES, TIMING_DRIFT_DECAY, TIMING_DRIFT_SIGMA, Player, timing_sigma_for,
 )
 from src.utils.config import DEFAULT_CONFIG_NAME  # noqa: E402
 
@@ -146,6 +146,10 @@ def show_one(name: str, form_range: int, rolls: int) -> None:
 
     print(f"  换算    基准准度 {base['avg_accuracy']:>3} → 落点误差 σ≈{sigma_of(base['avg_accuracy']):.1f}ms"
           f"    基准手速 {base['speed']:>3} → 能从容处理 {gap_of(base['speed']):.0f}ms 的同键间隔")
+    # 慢漂移：按判定逐次演化的系统性偏差（每人一样、和名字无关），稳态幅度 ≈ σ/sqrt(1-衰减²)
+    drift = TIMING_DRIFT_SIGMA / (1.0 - TIMING_DRIFT_DECAY ** 2) ** 0.5
+    print(f"          另外每人都有 {drift:.1f}ms 的「慢漂移」（成段打早/打晚，不是白噪声）——"
+          f"所以再准的人也不会必然全大 P")
     print()
 
 

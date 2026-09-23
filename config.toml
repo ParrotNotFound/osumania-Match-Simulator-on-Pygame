@@ -26,11 +26,26 @@ debug = false                # true = 在左上角显示当前歌曲时间等调
 headless = false
 
 # --- 各阶段的等待时间（毫秒）---
-# 等待期间屏幕中央会实时显示 Countdown:xx（距离比赛真正开始的剩余秒数）
-start_delay = 5000           # 从启动到第一场比赛开始前（这段时间在展示曲库）
-song_select_delay = 5000     # 从切到选曲页面，到选出本轮曲目
-match_start_delay = 5000     # 从选完歌，到比赛真正开始（音乐在这之后才响起）
-results_delay = 5000         # 每场打完后，成绩展示停留多久
+# 等待期间屏幕左下角会实时显示 Countdown:xx（距离比赛真正开始的剩余秒数）。
+#
+# 选曲页会经历**两个阶段**，全程都有音乐：
+#   1) song_select_delay：画面已经在选曲页，但**还没点出下一首**要打什么，
+#      这时候放的是"刚刚打完的那首"（整场的第一局则放下面的 prelude_song）；
+#   2) match_start_delay：点出下一首并开始试听它，画面仍停在选曲页。
+# 两个阶段都走完才切到游玩页面，之后还要再等 preroll_delay 才开始滚谱面。
+start_delay = 10000           # 启动后停留在选曲页、放 prelude_song 的时间
+song_select_delay = 15000     # 选曲页第一阶段：还不点出下一首，继续放刚打完的那首
+match_start_delay = 15000     # 选曲页第二阶段：点出下一首并试听
+preroll_delay = 1000          # 切到游玩页面后、谱面开始滚之前的固定等待
+results_delay = 5000          # 每场打完后，成绩展示停留多久
+
+# start_delay 期间放什么（支持目录里的任意歌曲，不需要进 [[songs]]）：
+#   留空            → 放"这一场的第一首"（按 [[picks]] 算）
+#   曲库 id         → 放曲库里那一首，例如 prelude_song = "RC1"
+#   音频文件路径    → 直接放这个文件，例如 prelude_song = "data/bgm/opening.mp3"
+#   歌曲文件夹路径  → 先按文件夹里 .osu 的 AudioFilename 找，再退回到第一个音频文件
+# 相对路径按 config.toml 所在目录解析（和 [[songs]] 的 folder 一样）。
+prelude_song = "data/beatmaps/457724 sakuzyo - Kronos/audio.mp3"
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +60,7 @@ rounds_to_win = 3                 # 先赢几局算赢下比赛（2 = BO3）—�
 resume = true
 # 赛果缓存：每局一个胜者序号（0 = 第一支队，1 = 第二支队），每局打完自动写回这里，
 # 启动时读取。想重新开一场把它清成 [] 即可（或者把 resume 改成 false）。
-results = [1, 0, 0, 1, 1]
+results = [0, 0, 1, 1, 1]
 
 # --- 计分赛模式 ---
 # true = 不管 rounds_to_win，把下面 [[picks]] 里写的曲目按顺序各打一遍，
@@ -78,7 +93,7 @@ follow_chart_od = true
 # 五档依次对应 lazer 的 Perfect / Great / Good / Ok / Meh。
 # （源码 osu.Game.Rulesets.Mania/Scoring/ManiaHitWindows.cs 里 OD10 是
 #   13.9 / 34 / 67 / 97 / 121，lazer 会 floor(x) + 0.5，所以是下面这些 .5 的数）
-perfect_g = 13.5              # lazer: Perfect
+perfect_g = 10              # lazer: Perfect
 perfect = 34.5                # lazer: Great
 great = 67.5                  # lazer: Good
 good = 97.5                   # lazer: Ok
@@ -154,10 +169,10 @@ TB = [200, 200, 200]
 # ===========================================================================
 [[songs]]
 id = "RC1"    
-title = "Suisei ni Nareta nara"
-artist = "Harumaki Gohan"
-folder = "data/beatmaps/1990123 Harumaki Gohan - Suisei ni Nareta nara [no video]"
-beatmap = "Harumaki Gohan - Suisei ni Nareta nara (Chrisse) [Daydreaming].osu"
+title = "Trick Heart"
+artist = "MIMI feat. Kasane Teto SV"
+folder = "data/beatmaps/2499321 MIMI feat. Kasane Teto SV - Trick Heart"
+beatmap = "MIMI feat. Kasane Teto SV - Trick Heart (Dereck101026) [Ace of Hearts].osu"
 
 [[songs]]
 id = "RC2"    
@@ -180,6 +195,12 @@ artist = "Lime"
 beatmap = "Lime - Pixel Planet (Wishtynite) [Expert].osu"
 
 [[songs]]
+id = "RC5"
+folder = "data/beatmaps/2263967 ROKINA - Schwerkraft"
+title = " Schwerkraft"
+artist = "ROKINA"
+
+[[songs]]
 id = "HB1"    
 title = "War in the Mirrorworld"
 artist = "Aoi"
@@ -194,23 +215,31 @@ folder = "data/beatmaps/2219679 Harumaki Gohan feat. Hatsune Miku - Hotaru wa In
 beatmap = "Harumaki Gohan feat. Hatsune Miku - Hotaru wa Inakatta (c6H8o6_) [Fireflies].osu"
 
 [[songs]]
+id = "HB3"
+folder = "data/beatmaps/2325733 Ave Mujica - KiLLKiSS (TV Size)"
+title = "KiLLKiSS (TV Size)"
+artist = "Ave Mujica"
+beatmap = "Ave Mujica - KiLLKiSS (TV Size) (ML-ysg) [killkiss].osu"
+
+[[songs]]
 id = "TB"
 folder = "data/beatmaps/755101 AA... Hisui Chazuke... - Stardust Prism"
 title = "Stardust Prism"
 artist = "AA... Hisui Chazuke..."
+
 # ===========================================================================
 #  队伍与玩家：必须是 2 支队伍，每队 1~3 名玩家（名字直接写在这里）
 #  玩家能力值由名字哈希生成，换个名字就是换个人
 # ===========================================================================
 [[teams]]
-name = "Red"
+name = "Stellarina-Aria"
 color = [255, 100, 90]
-players = ["R1","R2","R3"]
+players = ["Tamiko","Hoshi","Kotone"]
 
 [[teams]]
-name = "Blue"
+name = "Pasta"
 color = [0, 150, 255]
-players = ["B1","B2","B3"]
+players = ["Salt","Veneto","Nill"]
 
 
 # ===========================================================================
@@ -222,12 +251,12 @@ players = ["B1","B2","B3"]
 # 曲库现在正好是这四首 RC，picks 也按同样顺序排满：第 1 局 RC1、第 2 局 RC2、第 3 局 RC3、第 4 局 RC4。
 # 注意当前 rounds_to_win = 1（BO1），普通模式下只打得到第 1 局；要四首都打一遍请把 score_mode 打开
 [[picks]]
-song = "RC1"
-[[picks]]
-song = "HB1"
-[[picks]]
-song = "HB2"
-[[picks]]
 song = "RC4"
+[[picks]]
+song = "RC5"
+[[picks]]
+song = "HB3"
+[[picks]]
+song = "RC3"
 [[picks]]
 song = "TB"

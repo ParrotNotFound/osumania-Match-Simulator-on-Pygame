@@ -92,6 +92,15 @@ TIMING_SIGMA_ANCHORS: Tuple[Tuple[float, float], ...] = (
     (0.0, 26.0), (40.0, 10.3), (60.0, 5.4), (70.0, 6.2),
     (80.0, 5.6), (90.0, 3.2), (100.0, 1.5),
 )
+# 「中段鼓包」：整体难度调整用，**只压准度能力值的中间段**，两头保持原样：
+#   准度 ≤ 30      ：完全不动（低准度本来就差，不用再压，这是"30 档如之前一样"）
+#   准度 40~90     ：σ 乘 TIMING_SIGMA_MID_BOOST（这一段整体下降）
+#   准度 90~95     ：线性收回原曲线，避免"准度 90 比 95 差一大截"的断崖
+#   准度 ≥ 95      ：回到原曲线（超高准的含金量不受影响，这是"95+ 如之前一样"）
+# 三条边界都是可调常量，方便按"中段该降多少"微调。
+TIMING_SIGMA_MID_BOOST = 1.25
+TIMING_SIGMA_MID_BOOST_FLOOR = 30.0   # 这个准度及以下不鼓包
+TIMING_SIGMA_MID_BOOST_EDGE = 95.0    # 这个准度及以上恢复原曲线
 # 「准度地板」的受力衰减：压力大的时候，精度差异不再是决定因素。
 #
 # 准度地板是一个**绝对毫秒数**（1.5~26ms），它不知道谱面有多难。难谱上体力/密度已经顶着一份
@@ -108,6 +117,23 @@ TIMING_SIGMA_ANCHORS: Tuple[Tuple[float, float], ...] = (
 #   1.6ms（Love!）           → β=0.75
 #   5.1ms（Vacant）          → β=0.05，准度基本退场
 TIMING_SIGMA_DAMP_K = 3.0
+# 「慢漂移」：人类落点误差里**不是**白噪声的那一份。
+#
+# 白噪声的模型下，σ ≤ 3ms 就意味着"725 个音符全落在大 P 窗口（±17ms）里"是必然事件
+# （单音符掉出去的概率 ~1e-5 → 全对 ~99%）—— 于是高准选手必然是"全大 P"，不像人。
+# 真实的人打简单谱并不是"每一下都贴着中心"，而是**整段偏一点**（打早/打晚一个稳定的量，
+# 几十秒内来回摆）。加上这一条之后，大 P 率就从"必然 100%"落到 95~99%、准确率落在
+# 99.7~99.9%，而且偏差是**成段出现**的 —— 画面/曲线上一眼看得出"人的痕迹"。
+#
+# 实现：每只手一条漂移，按判定逐次演化（指数衰减 + 白噪声），直接加进落点：
+#     drift ← drift × TIMING_DRIFT_DECAY + N(0, TIMING_DRIFT_SIGMA)
+#     落点 = μ + N(0, σ) + drift_hand
+# 真正决定"大 P 率掉多少"的是它的**稳态幅度**：
+#     σ_漂移 ≈ TIMING_DRIFT_SIGMA / sqrt(1 − DECAY²) = 2.5 / sqrt(1−0.94²) ≈ 6.9ms
+# 实测（Science[Easy] 732 判定、准度 90）：大 P 率 100% → 98%、准确率 100% → 99.97%，
+# 一局里多出十来个 GREAT —— 这才是"人"的样子。想更飘就调大 TIMING_DRIFT_SIGMA。
+TIMING_DRIFT_SIGMA = 2.5     # 每次判定给漂移加多少白噪声（毫秒）
+TIMING_DRIFT_DECAY = 0.94    # 漂移的记忆系数：越小漂得越快、成段感越弱
 # 长条的"松手判定"：不吃手速（不算同键间隔、也不耗体力），但比点击更容易打偏
 LONG_RELEASE_SIGMA_SCALE = 1.8
 # 体力消耗：越密越费，体力越高越省
@@ -131,7 +157,7 @@ CHOKE_SCORE_BOOST = 0.5     # 自己分高时的额外倍率
 CHOKE_MATCH_POINT_BOOST = 1.5  # 赛点的额外倍率
 CHOKE_LATENCY = 120.0       # 手抖时落点整体偏晚多少毫秒
 CHOKE_SIGMA = 45.0          # 手抖时的抖动幅度
-SCORE_PRESSURE_REF = 900000.0  # 分数（0~1000000）到多少算"高分"
+SCORE_PRESSURE_REF = 1000000.0  # 分数（0~1000000）到多少算"高分"
 
 # ---------------- 计分：照搬 osu!lazer 的 mania 方案 ----------------
 # 源码：osu.Game.Rulesets.Mania/Scoring/ManiaScoreProcessor.cs
@@ -166,26 +192,52 @@ def timing_sigma_for(accuracy: float) -> float:
     这是玩家身上**唯一**一处"由准度决定"的误差
     （另一份是密度压力/疲劳，那是手速和体力的事）。
 
-    曲线是 `TIMING_SIGMA_ANCHORS` 那张锚点表的分段线性插值（超出两端取端点值）：
+    基线是 `TIMING_SIGMA_ANCHORS` 那张锚点表的分段线性插值（超出两端取端点值）：
         准度   0 → 26.0     20 → 17.2     40 → 10.3     50 → 7.6
               60 →  5.4     70 →  6.2     80 →  5.6     90 → 3.2     100 → 1.5
-    60 及以下与原来的光滑曲线完全一致；70~80 被特意顶高（削弱中高准），85 以后迅速压到地板
+    60 及以下与更早那条光滑曲线一致；70~80 被特意顶高（削弱中高准），85 以后迅速压到地板
     （凸显超高准）。为什么不用一条光滑曲线：OD6.5 的大 P 窗口 ±17ms，σ 低于 ~4ms 就 100% 大 P，
     光滑曲线在准度 70 时已经掉到 3.7ms，把 70~100 全拍平了。
+
+    在此之上再叠「中段鼓包」（`TIMING_SIGMA_MID_BOOST`）：只把准度 40~90 的 σ 抬高一截，
+    30 及以下与 95 及以上保持原样，90~95 线性收回，避免断崖。
 
     游戏里（Player.timing_sigma）和独立小工具（ability.py）都走这一个函数，
     免得两处各写一遍、改了一处忘了另一处。
     """
     value = max(0.0, min(100.0, float(accuracy)))
+    return _sigma_from_anchors(value) * _mid_boost_factor(value)
+
+
+def _sigma_from_anchors(accuracy: float) -> float:
+    """锚点表本身的分段线性插值（不含中段鼓包）。"""
     anchors = TIMING_SIGMA_ANCHORS
-    if value <= anchors[0][0]:
+    if accuracy <= anchors[0][0]:
         return anchors[0][1]
     for (x0, y0), (x1, y1) in zip(anchors, anchors[1:]):
-        if value <= x1:
+        if accuracy <= x1:
             if x1 <= x0:
                 return y1
-            return y0 + (y1 - y0) * (value - x0) / (x1 - x0)
+            return y0 + (y1 - y0) * (accuracy - x0) / (x1 - x0)
     return anchors[-1][1]
+
+
+def _mid_boost_factor(accuracy: float) -> float:
+    """准度 → 中段鼓包的倍率（1.0 = 不动）。
+
+    [FLOOR, 90] 区间乘 `TIMING_SIGMA_MID_BOOST`；FLOOR 以下与 EDGE 以上是 1.0；
+    90~EDGE 线性收回 1.0（所以 90→95 是平滑过渡，不是断崖）。
+    """
+    boost = TIMING_SIGMA_MID_BOOST
+    if boost == 1.0:
+        return 1.0
+    floor = TIMING_SIGMA_MID_BOOST_FLOOR
+    edge = TIMING_SIGMA_MID_BOOST_EDGE
+    if accuracy <= floor or accuracy >= edge or edge <= 90.0:
+        return 1.0
+    if accuracy <= 90.0:
+        return boost
+    return boost + (1.0 - boost) * (accuracy - 90.0) / (edge - 90.0)
 
 
 ACCURACY_BASE: Dict[str, int] = {
@@ -306,16 +358,19 @@ class Player:
     # ------------------------------------------------------------------
     @property
     def timing_sigma(self) -> float:
-        """准度决定的落点误差地板（毫秒）：σ 随准度下降而变大（锚点表见 TIMING_SIGMA_ANCHORS）。
+        """准度决定的落点误差地板（毫秒）：σ 随准度下降而变大。
 
+        正式曲线见 `TIMING_SIGMA_ANCHORS` + 中段鼓包（`timing_sigma_for`）。
         `timing_sigma_override` 是给标定脚本用的旁路：填 (上限, 指数) 就临时改用
-        那条光滑曲线算，不填就走正式的分段锚点表。
+        那条光滑曲线算（同样叠中段鼓包，方便对比），不填就走正式锚点表。
         """
+        accuracy = max(0.0, min(100.0, float(self.avg_accuracy)))
         if self.timing_sigma_override is not None:
             sigma_max, exponent = self.timing_sigma_override
-            progress = 1.0 - max(0.0, min(100.0, float(self.avg_accuracy))) / 100.0
-            return TIMING_SIGMA_MIN + (sigma_max - TIMING_SIGMA_MIN) * (progress ** exponent)
-        return timing_sigma_for(self.avg_accuracy)
+            progress = 1.0 - accuracy / 100.0
+            base = TIMING_SIGMA_MIN + (sigma_max - TIMING_SIGMA_MIN) * (progress ** exponent)
+            return base * _mid_boost_factor(accuracy)
+        return timing_sigma_for(accuracy)
 
     @property
     def fatigue(self) -> float:
@@ -399,6 +454,8 @@ class Player:
         self.accuracy_judged: int = 0
 
         self.stamina_left: List[float] = [INITIAL_STAMINA, INITIAL_STAMINA]
+        # 两只手各一条"慢漂移"（见 TIMING_DRIFT_SIGMA）：每首歌开头从 0 起漂
+        self.drift: List[float] = [0.0, 0.0]
         # 每个键位上一个"已经结算过的音符时间"，用来算同键间隔（≈ 谱面密度）
         self.last_note_time: List[int] = [INITIAL_TAP_TIME] * TRACK_COUNT
         # 每只手上一次出力的时间，用来算空档（回复体力用）
@@ -410,6 +467,8 @@ class Player:
         self.active_notes: List[Note] = []
         # 已经按下、还在按住的长条（等松手判定）
         self.holding_notes: List[Note] = []
+        # 最近一根按下的长条是哪只手（松手判定要取那只手的漂移）
+        self.long_release_hand: int = 0
 
         self.judgement_counts: Dict[str, int] = {key: 0 for key in JUDGEMENTS}
         self.last_judgement: str = ""
@@ -480,7 +539,7 @@ class Player:
         self._remove_note(note)
 
         # 先按当前体力状态出手，再结算这一下消耗掉的体力
-        press_offset = self._press_offset(tapdist) + self._choke_offset()
+        press_offset = self._press_offset(tapdist, hand) + self._choke_offset()
         self._drain_stamina(hand, tapdist, rest)
 
         judgement = self.judge_system.get_judgement(press_offset)
@@ -490,6 +549,8 @@ class Player:
             self._process_hit(note, current_time, press_offset)
             if note.is_long:
                 self.holding_notes.append(note)
+                # 记下这根长条是哪只手按住的：松手判定要用这只手的漂移
+                self.long_release_hand = hand
 
     def _resolve_release(self, note: Note, current_time: int) -> None:
         """结算长条的"松手"：另算一次判定，不吃手速也不耗体力。"""
@@ -497,7 +558,7 @@ class Player:
             self.holding_notes.remove(note)
         except ValueError:
             pass
-        release_offset = self._release_offset()
+        release_offset = self._release_offset(self.long_release_hand)
         judgement = self.judge_system.get_judgement(release_offset)
         if judgement == 'miss':
             self._process_miss(note, current_time)
@@ -519,7 +580,20 @@ class Player:
         damp = math.exp(-((density + fatigue) / TIMING_SIGMA_DAMP_K) ** 2)
         return density, fatigue, damp
 
-    def _release_offset(self) -> float:
+    def _advance_drift(self, hand: int) -> float:
+        """推进这只手的"慢漂移"并返回它当前的值（毫秒，正数 = 这一段习惯性打晚）。
+
+        演化是"指数衰减 + 白噪声"：drift ← drift × DECAY + N(0, DRIFT_SIGMA)。
+        每结算一个判定走一步，所以漂移的时间尺度跟着这首歌的音符走 ——
+        密谱漂得快、稀疏谱漂得慢，和"人靠肌肉记忆维持节奏"的直觉一致。
+        """
+        if TIMING_DRIFT_SIGMA <= 0.0:
+            return 0.0
+        value = self.drift[hand] * TIMING_DRIFT_DECAY + self.rng.gauss(0.0, TIMING_DRIFT_SIGMA)
+        self.drift[hand] = value
+        return value
+
+    def _release_offset(self, hand: int = 0) -> float:
         """松手判定的落点误差。
 
         和点击判定的区别有两条：
@@ -530,6 +604,7 @@ class Player:
         另外**只有这里吃稳定性**：长条松手是靠"撑住"的，稳不稳直接体现在这里；
         按下那一下不吃稳定性（见 `_press_offset`）。
         准度地板和疲劳两边一样 —— 准度地板同样按当时的压力打折（`_stress_sigma`）。
+        漂移也照吃：松手时那只手正偏在哪儿，尾巴就偏在哪儿。
         """
         fatigue = self.fatigue
         _, fatigue_sigma, damp = self._stress_sigma(0.0)
@@ -537,9 +612,11 @@ class Player:
                  + fatigue_sigma
                  + CONSISTENCY_SIGMA_ADD * (1.0 - self.consistency / 100.0))
         sigma *= LONG_RELEASE_SIGMA_SCALE
-        return self.rng.gauss(FATIGUE_LATENCY * fatigue, sigma)
+        # 长条整根期间不会逐次推进漂移，这里直接取这只手当前的值
+        drift = self.drift[hand] if TIMING_DRIFT_SIGMA > 0.0 else 0.0
+        return self.rng.gauss(FATIGUE_LATENCY * fatigue, sigma) + drift
 
-    def _press_offset(self, tapdist: int) -> float:
+    def _press_offset(self, tapdist: int, hand: int = 0) -> float:
         """这一次按键相对音符时间偏了多少毫秒（正数 = 打晚）。
 
         σ（误差大小）= 准度地板（按压力打折）+ 密度压力项 + 疲劳项；
@@ -548,6 +625,9 @@ class Player:
 
         「准度地板按压力打折」是这一版的要点：它保证**准度只在"其它压力很小"的谱面上
         才有决定权**（简单谱 → 决定小 P 频率），难谱上让位给手速和体力。
+
+        `hand` 用来推进/取用那只手的**慢漂移**（见 `_advance_drift`）——
+        每结算一个判定推进一次，所以漂移是"成段"的，不是白噪声。
         """
         required_gap = SPEED_GAP_MAX - (SPEED_GAP_MAX - SPEED_GAP_MIN) * (self.speed / 100.0)
         # 略微超出能力范围只是"有点吃力"，真的差一大截才会崩：
@@ -561,7 +641,7 @@ class Player:
         sigma = self.timing_sigma * damp + density_sigma + fatigue_sigma
 
         mu = DENSITY_LATENCY * density_pressure + FATIGUE_LATENCY * fatigue
-        return self.rng.gauss(mu, sigma)
+        return self.rng.gauss(mu, sigma) + self._advance_drift(hand)
 
     def _drain_stamina(self, hand: int, tapdist: int, rest: int = 0) -> None:
         """结算一个音符的体力：越密越费，体力越高越省；这只手歇得久会回一点。

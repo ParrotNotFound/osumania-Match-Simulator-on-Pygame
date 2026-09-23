@@ -1,10 +1,11 @@
 # src/core/game.py
 """主游戏循环：状态机 + 全部渲染。
 
-状态流转：
-    MENU（启动后停 start_delay 毫秒，展示曲库）
-      -> SONG_SELECT（选曲界面，停 song_select_delay 毫秒，期间选出本轮曲目）
-      -> PLAYING（先空等 match_start_delay 毫秒，音乐响起后开始判定）
+状态流转（选曲页会经历两个阶段，全程都有音乐）：
+    MENU（启动后停 start_delay 毫秒，展示曲库；放 prelude_song）
+      -> SONG_SELECT 第一阶段（song_select_delay：**不点出下一首**，接着放刚打完的那首）
+      -> SONG_SELECT 第二阶段（match_start_delay：点出下一首并试听，仍停在选曲页）
+      -> PLAYING（切到游玩页面，空等 preroll_delay 毫秒后音频从头播放、谱面开始滚）
       -> RESULTS（本局成绩展示 results_delay 毫秒）
       -> 回到 SONG_SELECT，或比赛已分胜负 -> FINISHED
 """
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import pygame
@@ -30,7 +32,28 @@ HEADLESS_STEP_MS = 100.0
 # 无 UI 模式的兜底：虚拟时间最多推进这么多秒还没结束就强制退出
 HEADLESS_MAX_SECONDS = 4 * 3600.0
 
+# 新点出的曲目，它在选曲页上的高亮闪烁多久（毫秒）；以前选过的那些一直常亮
+REVEAL_FLASH_MS = 1200
+# 闪烁的半个周期：亮 blink_on_ms、灭 blink_off_ms，交替
+REVEAL_FLASH_ON_MS = 170
+REVEAL_FLASH_OFF_MS = 110
+
 FONT_SIZES = tuple(range(20, 80, 5))
+
+# prelude_song 能填的音频后缀（填文件路径时按这个认；填文件夹时按这个去找）
+AUDIO_EXTENSIONS: Tuple[str, ...] = ('.mp3', '.ogg', '.wav', '.flac', '.opus')
+
+
+@dataclass
+class PreludeAudio:
+    """start_delay 期间放的那段音乐。
+
+    `prelude_song` 可以直接指向**目录里的任意歌曲**（不用进 [[songs]]）：
+    给音频文件就用它；给歌曲文件夹就先按 .osu 里写的 AudioFilename 找，
+    再退回到文件夹里第一个认识的音频文件。留空则退回"这一场的第一首"。
+    """
+    audio_path: str
+    label: str
 
 # pygame 默认字体没有中文字形（会渲染成方块），所以优先找一个系统里带中文的字体
 CJK_FONT_CANDIDATES = (
@@ -128,10 +151,23 @@ class OsuGame:
         # 游戏状态
         self.game_state = "MENU"  # MENU, SONG_SELECT, PLAYING, RESULTS, FINISHED
         self.state_entered_at = 0
-        self.current_time = 0     # 歌曲时间轴（负数代表还在 match_start_delay 的准备时间里）
+        self.current_time = 0     # 歌曲时间轴（负数代表还在 preroll_delay 的准备时间里）
         self.song_start_time = 0
         self.last_frame_tick = 0
         self.music_started = False
+        # 选曲页的两个阶段：先"还没点出下一首"（放刚打完的那首），再"点出下一首并试听"
+        self.song_revealed = False
+        self._revealed_song: Optional[Song] = None
+        # 刚打完的那首（没有下一首可放时用它当背景音乐）
+        self._last_played_song: Optional[Song] = None
+        # start_delay 期间放的那段音乐（在 _start_prelude_music 里解析出来）
+        self._prelude: Optional[PreludeAudio] = None
+        # 本场是否已经打过至少一局（决定第一阶段高亮"上一轮那首"还是什么都不高亮）
+        self.has_played_round = False
+        # 刚点出的那首在选曲页上闪到什么时候（毫秒时间戳，见 REVEAL_FLASH_MS）
+        self._reveal_flash_until = 0
+        # 切到游玩页面后、谱面开始滚之前的那段固定等待是否走完了
+        self.preroll_done = False
         self.round_winner = None  # 刚打完那一局的胜者，用于成绩展示
 
         # 加载字体与资源
@@ -236,6 +272,8 @@ class OsuGame:
             self._run_headless()
             return
 
+        # 开局（MENU 阶段）就把 prelude 音乐放起来：整段等待里都有音乐
+        self._start_prelude_music()
         self.running = True
         while self.running:
             for event in pygame.event.get():
@@ -296,16 +334,25 @@ class OsuGame:
     def _update(self) -> None:
         """更新游戏逻辑
 
-        一个完整循环：
-            MENU(start_delay) -> SONG_SELECT(song_select_delay)
-              -> PLAYING(match_start_delay 后开打) -> RESULTS(results_delay) -> 回到 SONG_SELECT
+        一个完整循环（选曲页会经历两个阶段）：
+            MENU(start_delay，放 prelude 音乐，选曲页上不点出任何歌)
+              -> SONG_SELECT(song_select_delay，仍不点出下一首，继续放刚打完/开场那首)
+              -> SONG_SELECT(match_start_delay，点出下一首并试听它)
+              -> PLAYING(preroll_delay 的固定等待后，音频从头播放、谱面开始滚)
+              -> RESULTS(results_delay) -> 回到 SONG_SELECT
             某队达到胜场后 RESULTS 结束即进入 FINISHED。
         """
         if self.game_state == "MENU":
             if self._state_elapsed() > self.settings.start_delay:
-                self._start_song_select()
+                self._enter_song_select()
         elif self.game_state == "SONG_SELECT":
-            if self._state_elapsed() > self.settings.song_select_delay:
+            if not self.song_revealed:
+                # 第一阶段：不点出下一首，时间到了才宣布（并开始试听）
+                if self._state_elapsed() > self.settings.song_select_delay:
+                    self._reveal_song()
+            elif self._state_elapsed() > (self.settings.song_select_delay
+                                          + self.settings.match_start_delay):
+                # 第二阶段结束：切到游玩页面（谱面还要再等 preroll_delay 才开始滚）
                 self._start_playing()
         elif self.game_state == "PLAYING":
             self._update_playing()
@@ -314,33 +361,33 @@ class OsuGame:
                 if self.match.is_finished:
                     self._set_state("FINISHED")
                 else:
-                    # 必须走 _start_song_select：它会重新选曲 + 重新结算选手
+                    # 必须走 _enter_song_select：它会重新结算选手
                     # （换名单、重掷能力值、清空上一局状态）。直接切 SONG_SELECT 会漏掉这些，
                     # 导致第二局拿上一局的旧谱面和旧状态重打。
-                    self._start_song_select()
+                    self._enter_song_select()
 
     def _time_until_match_start(self) -> Optional[float]:
         """距离"比赛真正开始"还有多少毫秒；已经开打或没有下一场时返回 None。
 
         跨越多个阶段累计：等待阶段把后面几个阶段的时长一起算进去，
-        所以从启动开始这个数字是一路连续倒数到 0 的。
+        所以从启动开始这个数字是一路连续倒数到 0 的（preroll 那 1 秒是"开始之后"的，
+        不算进倒计时）。
         """
         settings = self.settings
+        wait = settings.song_select_delay + settings.match_start_delay
         if self.game_state == "MENU":
-            remaining = (settings.start_delay - self._state_elapsed()
-                         + settings.song_select_delay + settings.match_start_delay)
+            remaining = settings.start_delay - self._state_elapsed() + wait
         elif self.game_state == "SONG_SELECT":
-            remaining = (settings.song_select_delay - self._state_elapsed()
-                         + settings.match_start_delay)
+            # 两个阶段共用同一个 state，所以剩余时间是"总等待 - 已经过的时间"
+            remaining = wait - self._state_elapsed()
         elif self.game_state == "RESULTS":
             if self.match.is_finished:
                 return None
-            remaining = (settings.results_delay - self._state_elapsed()
-                         + settings.song_select_delay + settings.match_start_delay)
+            remaining = settings.results_delay - self._state_elapsed() + wait
         elif self.game_state == "PLAYING":
             if self.music_started:
                 return None
-            remaining = -self.current_time   # 开打前的准备时间里 current_time 是负数
+            remaining = 0.0
         else:
             return None
         return max(0.0, float(remaining))
@@ -356,20 +403,159 @@ class OsuGame:
         done = sum(self.match.teams[0].players[0].judgement_counts.values())
         return min(1.0, done / total)
 
-    def _start_song_select(self) -> None:
-        """选曲：选出这一轮要打的歌，并播放它的试听片段"""
+    def _enter_song_select(self) -> None:
+        """进入选曲页的**第一阶段**：画面切过去，但还不点出下一首要打哪首。
+
+        音乐继续放"刚刚打完的那首"（第一局则接着放 prelude_song）。
+        """
+        # 从 MENU 进来就是整场开局：prelude 已经在 run() 里放着了，这里不能再放一遍
+        # （`music.play()` 是从头播，重放会听出来"莫名其妙重头开始"）。
+        from_menu = self.game_state == "MENU"
+        self.song_revealed = False
+        self._revealed_song = None
+        self._set_state("SONG_SELECT")
+        if self._last_played_song is not None:
+            # 接着放刚刚打完的那首（每局都会重新起一遍，这里就当作换片）
+            self._play_select_audio(self._last_played_song)
+        elif not from_menu:
+            self._play_prelude_audio()
+        else:
+            pass
+
+    def _reveal_song(self) -> None:
+        """选曲页的**第二阶段**：点出这一轮要打哪首，并把它试听出来。
+
+        还停留在选曲页 —— 直接开打要等 match_start_delay 结束（见 `_update`）。
+        刚点出的这一首会在选曲页上闪几下（`REVEAL_FLASH_MS`），
+        之前轮次选过的那些则一直常亮。
+        """
         song = self._select_song()
         if song is None:
             print("错误：没有可用曲目，无法开始比赛")
             self.running = False
             return
-        self.current_song = song
+        self._revealed_song = song
+        self.song_revealed = True
+        self._reveal_flash_until = self._now() + REVEAL_FLASH_MS
         self.playlist = list(song.notes)
+        # 直接切换到这一首的试听（不用先 stop：load 会顶掉上一首）
         self._play_select_audio(song)
-        self._set_state("SONG_SELECT")
+
+    def _prelude_song(self) -> Optional[Song]:
+        """start_delay 期间要放的曲子（曲库里的那一首）：配置里指定优先，否则用这场的第 1 首。"""
+        wanted = (self.settings.prelude_song or "").strip()
+        if wanted:
+            found = self.match.find_song(wanted)
+            if found is not None:
+                return found
+        first, _team = self.match.pick_for_round(0)
+        return first or (self.match.song_pool[0] if self.match.song_pool else None)
+
+    def _resolve_prelude(self) -> Optional[PreludeAudio]:
+        """把 [game] prelude_song 解析成一段可播放的音频。
+
+        支持四种写法（都不需要进 [[songs]]）：
+            1. 曲库里的 id（如 "RC1"）→ 用它自己的音频；
+            2. 音频文件路径（相对 config.toml 解析，如 data/bgm/op.mp3）；
+            3. 歌曲文件夹 → 先读里面的 .osu 里的 AudioFilename，再退回到第一个音频文件；
+            4. 留空 → 退回"这一场的第一首"（按 [[picks]]）。
+        解析不出来就打印中文提示并退回第 4 种，不打断比赛。
+        """
+        wanted = (self.settings.prelude_song or "").strip()
+        if wanted:
+            found = self.match.find_song(wanted)
+            if found is not None:
+                try:
+                    return PreludeAudio(found.load_audio(), f"曲库 {found.id}")
+                except FileNotFoundError as error:
+                    print(f"警告：prelude_song = \"{wanted}\" 的音频找不到（{error}）")
+            path = self.config.resolve(wanted)
+            if os.path.isdir(path):
+                resolved = self._find_audio_in_folder(path)
+                if resolved is not None:
+                    return PreludeAudio(resolved, f"文件夹 {os.path.basename(path) or path}")
+                print(f"警告：prelude_song 指向的文件夹里没有音频：{path}")
+            elif os.path.isfile(path):
+                if path.lower().endswith(AUDIO_EXTENSIONS):
+                    return PreludeAudio(path, os.path.basename(path))
+                # 给的是 .osu 之类的文件：按它所在目录找音频
+                resolved = self._find_audio_in_folder(os.path.dirname(path))
+                if resolved is not None:
+                    return PreludeAudio(resolved, os.path.basename(path))
+                print(f"警告：prelude_song 指向的文件既不是音频，所在文件夹里也没有音频：{path}")
+            else:
+                print(f"警告：prelude_song = \"{wanted}\" 既不是曲库 id、也不是存在的"
+                      f"文件/文件夹（解析为 {path}），改为放这场的第 1 首")
+
+        song = self._prelude_song()
+        if song is None:
+            return None
+        try:
+            return PreludeAudio(song.load_audio(), f"曲库 {song.id}")
+        except FileNotFoundError as error:
+            print(f"警告：prelude 音频找不到（{error}），本次不播 prelude 音乐")
+            return None
+
+    @staticmethod
+    def _find_audio_in_folder(folder: str) -> Optional[str]:
+        """在文件夹里找音频：优先 .osu 里 AudioFilename 写的那个，其次按后缀扫。
+
+        .osu 只扫一层目录，按文件名排序取第一个能读的 —— prelude 只是背景音乐，
+        不值得为它引整套谱面解析。
+        """
+        if not os.path.isdir(folder):
+            return None
+        names: list = []
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            return None
+        for name in names:
+            if not name.lower().endswith('.osu'):
+                continue
+            try:
+                with open(os.path.join(folder, name), 'r',
+                          encoding='utf-8-sig', errors='replace') as handle:
+                    for line in handle:
+                        if line.strip().startswith("AudioFilename:"):
+                            audio = line.split(':', 1)[1].strip()
+                            candidate = os.path.join(folder, audio)
+                            if os.path.isfile(candidate):
+                                return candidate
+            except OSError:
+                continue
+        for extension in AUDIO_EXTENSIONS:
+            for name in names:
+                if name.lower().endswith(extension):
+                    return os.path.join(folder, name)
+        return None
+
+    def _start_prelude_music(self) -> None:
+        """开局（MENU 阶段）就把 prelude 音乐放起来。"""
+        self._prelude = self._resolve_prelude()
+        if self._prelude is None:
+            return
+        print(f"提示：prelude 音乐（{self._prelude.label}）")
+        self._play_prelude_audio()
+
+    def _play_prelude_audio(self) -> None:
+        """播放已经解析好的 prelude 音频（没有就什么都不做）。"""
+        if self._prelude is None:
+            self._play_select_audio(self._last_played_song or self._prelude_song())
+            return
+        if not self.audio_ok:
+            return
+        try:
+            pygame.mixer.music.load(self._prelude.audio_path)
+            pygame.mixer.music.play()
+        except Exception as error:
+            print(f"警告：prelude 音乐播放失败（{error}）")
 
     def _select_song(self) -> Optional[Song]:
-        """按 config.toml 的 [[picks]] 选出这一轮的曲目。"""
+        """按 config.toml 的 [[picks]] 选出这一轮的曲目（并结算选手）。
+
+        注意"选曲"只发生一次：`_reveal_song` 里调它，之后 `current_song` 就固定了。
+        """
         index = self.match.next_round_index()
         song, team_index = self.match.pick_for_round(index)
         if song is None:
@@ -444,19 +630,17 @@ class OsuGame:
               f"括号内为本局手感偏移）")
 
     def _start_playing(self) -> None:
-        """进入对局：先留 match_start_delay 毫秒的准备时间，再开始放歌。
+        """切到游玩页面：谱面先不滚，等 preroll_delay 的固定等待。
 
-        注意：音频必须在这里（而不是歌曲时间走到 0 的那一帧）载入。
-        如果淡出还没结束就调用 music.load()，SDL_mixer 会一直阻塞到淡出结束，
-        那一帧会卡住好几秒，开头几秒的音符会被所有人一起漏掉。
+        试听的那首音乐**继续放着**（进入 PLAYING 不会打断它）；等
+        `preroll_delay` 走完，再把音频从头开始、同时让谱面滚动（见 `_update_playing`）。
+        所以"宣布曲目 -> 试听 -> 开打"中间没有静音，只有 preroll 结束那一下从头开始。
         """
-        song = self.current_song
-        self._stop_music()
-        if song is not None:
-            self._load_song_audio(song)
-
-        self.song_start_time = self._now() + self.settings.match_start_delay
-        self.current_time = -self.settings.match_start_delay
+        self.current_song = self._revealed_song
+        self.preroll_done = False
+        self.has_played_round = True
+        self.song_start_time = self._now()
+        self.current_time = 0
         self.last_frame_tick = self._now()
         self.music_started = False
         self._set_state("PLAYING")
@@ -472,18 +656,24 @@ class OsuGame:
         now = self._now()
         frame_gap = now - self.last_frame_tick
         self.last_frame_tick = now
+        if not self.preroll_done:
+            # 切到游玩页面后的固定等待：谱面停在原地、不判定，试听音乐继续放
+            if self._state_elapsed() >= self.settings.preroll_delay:
+                self.preroll_done = True
+                self.song_start_time = now
+                self.current_time = 0
+                # 音频从头开始，和谱面时间轴对齐（试听与正式播放是两回事）
+                self._stop_music()
+                self._load_song_audio(song)
+                self._play_song_audio()
+                self.music_started = True
+            return
+
         self.current_time = now - self.song_start_time
         if frame_gap > 500 and not self.headless:
             # 卡顿会让这一段时间里的音符直接过期，说一声方便排查
             # （无 UI 模式是故意大步长推进的，不算卡顿）
             print(f"警告：对局中卡顿了 {frame_gap}ms，可能有音符被跳过")
-
-        if not self.music_started:
-            # 开打前的准备时间里不判定，音符也不会提前滚出来
-            if self.current_time >= 0:
-                self.music_started = True
-                self._play_song_audio()
-            return
 
         self._update_notes()
         self._update_players()
@@ -524,6 +714,8 @@ class OsuGame:
         winning_team = max(range(len(totals)), key=lambda index: totals[index]) if totals else 0
         self.match.record_round_result(winning_team)
         self._stop_music()
+        # 记下刚打完的这首：下一轮 SONG_SELECT 的第一阶段要接着放它
+        self._last_played_song = self.current_song
         self.round_winner = self.match.teams[winning_team] if winning_team < len(self.match.teams) else None
 
         # 每局都把双方得分和本局胜者打到控制台（无 UI 模式下这就是主要输出）
@@ -688,7 +880,15 @@ class OsuGame:
         self.screen.blit(text_image, rect)
 
     def _render_results(self) -> None:
-        """一局打完后展示本局成绩（停 results_delay 毫秒）"""
+        """一局打完后展示成绩（停 results_delay 毫秒）。
+
+        计分赛：**不出"谁拿下本局"**，直接显示"到目前为止的总分 + 在表里的实时排名"；
+        普通赛：照旧显示本局双方队员分数、本局胜者与大比分。
+        """
+        if self.match.score_mode:
+            self._render_score_board(ending=False)
+            return
+
         self._render_team_big_points()
 
         title_text = f"第 {self.match.current_round + 1} 局结束"
@@ -721,9 +921,12 @@ class OsuGame:
         self.screen.blit(text_image, (4, 4))
 
     def _render_ending(self) -> None:
-        """显示比赛结果：计分赛看总分排名榜，普通赛看谁赢"""
+        """显示比赛结果：计分赛看总分排名榜，普通赛看谁赢。
+
+        计分赛不显示"谁赢了整场"那类胜负画面 —— 从头到尾都只给成绩表和排名。
+        """
         if self.match.score_mode:
-            self._render_score_board()
+            self._render_score_board(ending=True)
             return
         self._render_team_big_points()
         who_wins = f"{self.match.winner.name} wins!" if self.match.winner else "Match over"
@@ -731,12 +934,16 @@ class OsuGame:
         t_width, _ = self._font(70, who_wins).size(who_wins)
         self.screen.blit(text_image, (640 - t_width / 2, 360))
 
-    def _render_score_board(self) -> None:
-        """计分赛结算榜。
+    def _render_score_board(self, ending: bool) -> None:
+        """计分赛的成绩表：到目前为止每首歌的总分 + 实时排名。
 
         中间一列是 Track1 / Track2 / ... / Total / Rank，
-        两侧各放一支队：每首歌的总分各占一行，倒数第二行是全部曲目的总分，
-        最后一行是名次。最后两行字号略大，分数千分位分隔并右对齐。
+        两侧各放一支队：每首歌的总分各占一行，倒数第二行是**目前为止**的总分，
+        最后一行是它在表里的名次。最后两行字号略大，分数千分位分隔并居中。
+
+        局中（`ending=False`，即每局打完后那几秒）和终局（`ending=True`）用的是同一张表 ——
+        唯一的区别是终局才显示成绩表的落盘路径。刚打完的那一局已经记进
+        `round_records`，所以每一局结束时表都会往下长一行，总分和名次同步更新。
         """
         records = self.match.round_records
         if not records:
@@ -791,8 +998,17 @@ class OsuGame:
             center_x = column_center[min(team_index, 1)]
             self.screen.blit(name_image, (center_x - name_image.get_width() / 2, 40))
 
-        if self.excel_written:
-            hint = f"成绩表：{self.excel_written}"
+        # 局中提示这一局已经打了几首、还剩几首；终局才提示成绩表写到了哪
+        if ending:
+            if self.excel_written:
+                hint = f"成绩表：{self.excel_written}"
+            else:
+                hint = ""
+        else:
+            done = len(records)
+            track_total = self.match.total_tracks() or done
+            hint = f"已完成 {done} / {track_total} 首 · 总分与排名实时更新"
+        if hint:
             hint_image = self._font(25, hint).render(hint, True, (140, 140, 140))
             self.screen.blit(hint_image, (640 - hint_image.get_width() / 2, 690))
 
@@ -845,14 +1061,36 @@ class OsuGame:
 
         s_width = 500
         s_height = 600 / len(songs)
-        # 高亮"这一轮选了哪首"：行号要按曲目在曲库里的次序算，不能按第几轮算，
+        # 高亮：**以前轮次选过的都常亮**，刚点出的那一首额外闪几下。
+        # 行号要按曲目在曲库里的次序算，不能按第几轮算，
         # 否则第 1 轮选 TB（曲库第 3 行）会被画到第一行上。
-        for chosen in self.match.selected_songs:
+        #
+        # 第一阶段（还没点出下一首）：`selected_songs` 里最后一条是**本轮的候选**，
+        # 这时还不能亮它（不然等于提前泄露了下一首），只亮它前面的那些。
+        revealed_count = len(self.match.selected_songs)
+        if not self.song_revealed and revealed_count > 0:
+            revealed_count -= 1
+
+        # 闪烁：在"亮/灭"之间按时间交替（按时间而不是帧数，免得帧率影响闪的时长）
+        now = self._now()
+        flashing = now < self._reveal_flash_until
+        if flashing:
+            period = REVEAL_FLASH_ON_MS + REVEAL_FLASH_OFF_MS
+            blink_on = (now - (self._reveal_flash_until - REVEAL_FLASH_MS)) % period \
+                < REVEAL_FLASH_ON_MS
+        else:
+            blink_on = True
+
+        for entry_index, chosen in enumerate(self.match.selected_songs):
             song = chosen["song"]
             team_index = chosen["team"]
             if song not in songs or team_index >= len(self.match.teams):
                 continue
             row = songs.index(song)
+            is_newest = entry_index == revealed_count - 1
+            # 刚点出的那首在"灭"的相位就跳过这一帧，画出来就是闪烁
+            if is_newest and flashing and not blink_on:
+                continue
             color = self.match.teams[team_index].color
             pygame.draw.rect(self.screen, color,
                              [640 - s_width / 2, 70 + s_height * row, s_width, s_height - 6])
