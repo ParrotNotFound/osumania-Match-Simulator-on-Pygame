@@ -18,7 +18,7 @@ from typing import Dict, Optional, Tuple
 
 import pygame
 
-from ..entities.player import Player
+from ..entities.player import INITIAL_STAMINA, Player
 from ..entities.song import Song
 from ..entities.team import Team
 from ..utils.config import DEFAULT_POOL_COLOR, JUDGEMENTS, ConfigError, GameConfig, load_config
@@ -75,6 +75,15 @@ def _find_cjk_font() -> Optional[str]:
 
 # 第四轨右侧那列判定计数的小字号
 JUDGEMENT_COUNT_FONT_SIZE = 18
+# 调试模式下"两只手剩余体力"那行灰字的排布（见 `_render_stamina_debug`）。
+# 位置是被逼出来的：选手面板高 290px，y+260 那条是分数条（高 20），再往下 10px 就是
+# 面板下缘、也就是下一个选手的面板顶。所以只空出 y+280~290 这一条 10px 的缝，
+# 字号单独建一个（`FONT_SIZES` 从 20 起、行高 14px 塞不下，而且那张表是 5 的倍数，
+# 动态往小试字号会踩到不存在的键）。18 号行高 12px、这行文本宽约 125px，
+# 放进 240px 宽的面板里绰绰有余，只在下缘压掉 2px（调试信息，可接受）。
+DEBUG_STAMINA_FONT_SIZE = 18
+DEBUG_STAMINA_FONT_TOP = 280      # 相对于选手面板左上角的 y 偏移
+DEBUG_STAMINA_COLOR: Tuple[int, int, int] = (130, 130, 130)  # 灰色小字
 # 判定计数的颜色，顺序同 JUDGEMENTS：完美+ 黄 / 完美 橙 / 很好 绿 / 好 蓝 / 差 淡灰 / 漏 红
 JUDGEMENT_COUNT_COLORS: Dict[str, Tuple[int, int, int]] = {
     'perfect_g': (255, 255, 0),
@@ -206,6 +215,8 @@ class OsuGame:
                 self.cjk_fonts[size] = pygame.font.Font(cjk_path, size)
         # 第四轨右侧那列判定计数用的小字（纯数字，用默认字体）
         self.count_font = pygame.font.Font(font, JUDGEMENT_COUNT_FONT_SIZE)
+        # 调试模式那行体力小字（要中文"疲"，所以用 CJK 字体；见 `DEBUG_STAMINA_*`）
+        self.debug_stamina_font = pygame.font.Font(cjk_path or font, DEBUG_STAMINA_FONT_SIZE)
 
     def _font(self, size: int, text: object) -> pygame.font.Font:
         """按文本内容选字体：含非 ASCII 字符用中文字体，否则用默认字体。"""
@@ -691,8 +702,16 @@ class OsuGame:
                     player.active_notes.append(note)
 
     def _update_players(self) -> None:
-        for team in self.match.teams:
+        # 先把"局面"信息喂给选手（局部压力 strain 的其中一个通道要用）：
+        # 对手这一局打到哪儿了、当前大比分如何。
+        teams = self.match.teams
+        scores = tuple(self.match.scores[:2]) if len(self.match.scores) >= 2 else (0, 0)
+        for team_index, team in enumerate(teams):
+            rival = max((other.total_score for index, other in enumerate(teams)
+                         if index != team_index), default=0.0)
             for player in team.players:
+                player.opponent_score = rival
+                player.match_scores = scores
                 player.play(self.current_time)
 
     def _song_finished(self) -> bool:
@@ -727,6 +746,17 @@ class OsuGame:
             for index, team in enumerate(record['teams']):
                 mark = "★" if index == winning_team else " "
                 print(f"  {mark} {team['name']:<14} {team['total']:>12,.0f}")
+            # 局部压力与两类失误：看得见"手紧/手抖"发生在谁身上、有多频繁
+            for team in teams:
+                for player in team.players:
+                    average = (player.strain_sum / player.strain_samples
+                               if player.strain_samples else 0.0)
+                    if average <= 0.0 and player.small_miss_count == 0 \
+                            and player.choke_count == 0:
+                        continue
+                    print(f"      {player.name:<14} 压力 均值{average:.2f}/峰值"
+                          f"{player.strain_peak:.2f}  小失误 {player.small_miss_count:>3}"
+                          f"  手抖 {player.choke_count:>2}")
             if winning_team < len(teams):
                 print(f"    → {teams[winning_team].name} 拿下本局，"
                       f"大比分 {self.match.scores[0]}:{self.match.scores[1]}")
@@ -1213,6 +1243,26 @@ class OsuGame:
 
         # 各判定的累计数量，竖排小字（队 0 贴第四轨右侧，队 1 贴第一轨左侧右对齐）
         self._render_judgement_counts(player, x, y + 38)
+
+        # 调试模式：在名字下面用灰色小字显示两只手各剩多少体力
+        if self.settings.debug:
+            self._render_stamina_debug(player, x, y)
+
+    def _render_stamina_debug(self, player: Player, x: int, y: int) -> None:
+        """调试用：灰字显示这个玩家**两只手各自**还剩多少体力。
+
+        `player.stamina_left` 是两只手各自的池子：索引 0 = 左手（轨道 0/1），1 = 右手（轨道 2/3）。
+        只有数字、不画体力条，免得抢了正常画面的注意力。`疲` 就是模型内部那个 0~1 的疲劳值
+        （两只手池子的平均），调参时最有参考价值的就是它 —— 池子往哪儿收敛一眼就看出来。
+
+        位置/字号/颜色见 `DEBUG_STAMINA_*` 常量。
+        """
+        left_hand = player.stamina_left[0] / INITIAL_STAMINA * 100.0
+        right_hand = player.stamina_left[1] / INITIAL_STAMINA * 100.0
+        # 留一位小数，这样"这一下花了多少体力"看得出来
+        text = f"L{left_hand:4.1f}% R{right_hand:4.1f}% 疲{player.fatigue:4.2f}"
+        image = self.debug_stamina_font.render(text, True, DEBUG_STAMINA_COLOR)
+        self.screen.blit(image, (x + 50 + 19.2, y + DEBUG_STAMINA_FONT_TOP))
 
     def _render_judgement_counts(self, player: Player, x: int, y: int) -> None:
         """竖排显示每个判定的累计数量。

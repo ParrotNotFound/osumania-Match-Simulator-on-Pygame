@@ -34,7 +34,8 @@ if PROJECT_ROOT not in sys.path:
 from src.entities.player import (  # noqa: E402
     DENSITY_EXPONENT, INITIAL_STAMINA, INITIAL_TAP_TIME, SPEED_GAP_MAX, SPEED_GAP_MIN,
     STAMINA_DEMAND_MAX, STAMINA_DEMAND_MIN, STAMINA_DEMAND_REF, STAMINA_DRAIN_K,
-    STAMINA_EFF_GAIN, STAMINA_EFF_MIN, STAMINA_RECOVER_FLOOR, STAMINA_RECOVER_K,
+    STAMINA_EFF_GAIN, STAMINA_EFF_MIN, STAMINA_LOW_GAIN, STAMINA_RECOVER_BASE,
+    STAMINA_RECOVER_FLOOR, STAMINA_RECOVER_K, stamina_cost_for, stamina_recover_for,
 )
 from src.entities.song import Song  # noqa: E402
 from src.utils.axis_to_track import axis_to_4k  # noqa: E402
@@ -53,11 +54,6 @@ FAST_FRACTION = 0.05    # "最快的一段"占总音符的比例
 def required_gap(speed: float) -> float:
     """这个手速下，同键间隔要多少毫秒才算"跟得上"（和 Player._press_offset 一致）。"""
     return SPEED_GAP_MAX - (SPEED_GAP_MAX - SPEED_GAP_MIN) * (speed / 100.0)
-
-
-def stamina_efficiency(stamina: float) -> float:
-    """体力 → 省力系数（和 Player._drain_stamina 一致）。"""
-    return STAMINA_EFF_MIN + STAMINA_EFF_GAIN * (stamina / 100.0)
 
 
 def percentile(values: Sequence[float], fraction: float) -> float:
@@ -181,14 +177,14 @@ def stamina_end(distances: Sequence[float], rests: Sequence[float],
 
     返回终盘的平均剩余比例（0~1）。这里不用闭式解，因为"回复不能超过满池"这条
     会削掉一部分回复量，逐音符走一遍才是和游戏完全一致的口径。
+
+    消耗/回复直接调 `player.py` 里那两个模块级函数（游戏里也是它们），
+    所以报告里的"体力要求"不可能和实际手感算错口径。
     """
     pools = [INITIAL_STAMINA, INITIAL_STAMINA]
-    efficiency = stamina_efficiency(stamina)
     for distance, rest, hand in zip(distances, rests, hands):
-        demand = min(STAMINA_DEMAND_MAX,
-                     max(STAMINA_DEMAND_MIN, STAMINA_DEMAND_REF / max(distance, 25.0)))
-        cost = STAMINA_DRAIN_K * demand / efficiency
-        recover = STAMINA_RECOVER_K * max(0.0, rest - STAMINA_RECOVER_FLOOR) / 1000.0
+        cost = stamina_cost_for(int(distance), stamina)
+        recover = stamina_recover_for(int(rest), pools[hand] / INITIAL_STAMINA)
         pools[hand] = min(INITIAL_STAMINA, max(0.0, pools[hand] - cost + recover))
     return (pools[0] + pools[1]) / (2.0 * INITIAL_STAMINA)
 
@@ -370,6 +366,9 @@ def notes_rows(free: float, keep: float) -> List[List]:
         ["", f"每按一下消耗 {STAMINA_DRAIN_K} × clamp({STAMINA_DEMAND_REF:.0f}/同键间隔, "
              f"{STAMINA_DEMAND_MIN}, {STAMINA_DEMAND_MAX}) ÷ 效率，效率 = "
              f"{STAMINA_EFF_MIN} + {STAMINA_EFF_GAIN} × 体力/100"],
+        ["", f"每按一下回复 {STAMINA_RECOVER_BASE} × (1 + {STAMINA_LOW_GAIN} × (1 − 当前体力))；"
+             f"手歇超过 {STAMINA_RECOVER_FLOOR:.0f}ms 再额外回 {STAMINA_RECOVER_K}/秒。"
+             "「越低回得越快」让终盘收敛到某个稳定值，而不是一路掉到 0"],
         ["同键间隔", "同一轨相邻两个音符的时间差；长条按头的时间算（松手判定不吃手速也不耗体力）"],
         ["常量来源", "src/entities/player.py，与游戏内模型完全一致"],
     ]

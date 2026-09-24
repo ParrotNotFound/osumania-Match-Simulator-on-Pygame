@@ -71,6 +71,27 @@ DENSITY_SIGMA_ADD = 38.0     # 密度压力**平方**后每 1 单位额外增加
 DENSITY_LATENCY = 50.0       # 密度压力**平方**后每 1 单位整体打晚多少毫秒
 FATIGUE_SIGMA_ADD = 15.0     # 体力彻底见底时额外增加的误差标准差
 FATIGUE_LATENCY = 22.0       # 体力彻底见底时整体打晚多少毫秒
+# 「低体力拖慢手」：体力见底时**平均点击间隔**会明显变大 —— 这是"体力"这项能力
+# 在观感上最直接的表现（不用看判定，光看画面就知道这人手沉了）。
+#
+# 实现上不是真的去改按键的时间（谱面时间是固定的），而是把"这一次按晚多少"整体
+# **连同它的抖动一起**放大：落点 = N(0,σ)×倍率 + μ×倍率，倍率 = 1 + SCALE×疲劳。
+# 于是体力越低落点越晚越散，相邻判定的实际间隔被拉长、漏键也开始出现。
+# 要更强/更弱只调这一个数（0 = 关掉这条通道）。
+FATIGUE_LATENCY_SCALE = 0.35
+# 「滞后累积」：手沉下来以后来不及把欠下的时间补回来，欠账会带进下一拍。
+#     这一拍欠的 = max(0, 落点)×FATIGUE_DEBT_SHARE        （打早了不算欠账）
+#     滞后 ← 滞后×FATIGUE_DEBT_DECAY + FATIGUE_DEBT_KEEP×这一拍欠的
+#     落点 += 滞后 × (1 + FATIGUE_LATENCY_SCALE×疲劳)
+# 只把每拍整体推晚一个固定量**看不出**"点击间隔变大"（所有音符一起后移，差值还是零）；
+# 累积之后才会出现"连着几拍一次比一次晚、然后猛地追回来"，也就是间隔被拉长又压回。
+# **稳定性要求**：欠账不能被完整地再喂给自己，否则会自激（落点越晚 → 欠账越大 → 更晚），
+# 残差 = FATIGUE_DEBT_DECAY×(1 + FATIGUE_DEBT_SHARE×FATIGUE_DEBT_KEEP) 必须明显小于 1。
+# 当前 0.85×(1+0.35×0.35) ≈ 0.95，所以收敛到一个有限幅度（均值放大约 1/(1−0.95) 的量级），
+# 但不会失控。想关掉这条就设 FATIGUE_DEBT_KEEP = 0。
+FATIGUE_DEBT_SHARE = 0.35       # 这一拍落点的多少比例算"欠账"
+FATIGUE_DEBT_DECAY = 0.85       # 欠账的衰减（越大拖得越久）
+FATIGUE_DEBT_KEEP = 0.35        # 欠账带入下一拍的比例
 CONSISTENCY_SIGMA_ADD = 3.0  # 稳定性 0 时长条**松手**判定的额外 σ（只作用于松手，不作用于按下）
 DENSITY_EXPONENT = 2.0       # >1 把惩罚集中到"真的跟不上"的地方
 TIMING_SIGMA_MAX = 26.0   # 准度 0 时的落点误差标准差（毫秒）
@@ -134,30 +155,90 @@ TIMING_SIGMA_DAMP_K = 3.0
 # 一局里多出十来个 GREAT —— 这才是"人"的样子。想更飘就调大 TIMING_DRIFT_SIGMA。
 TIMING_DRIFT_SIGMA = 2.5     # 每次判定给漂移加多少白噪声（毫秒）
 TIMING_DRIFT_DECAY = 0.94    # 漂移的记忆系数：越小漂得越快、成段感越弱
+# 体力消耗：越密越费，体力越高越省。
+# `stamina_cost_for` / `stamina_recover_for` 两条公式在文件下方，标定工具直接调它们。
+STAMINA_DRAIN_K = 4.5           # 每按一下的基础消耗（调大 = 整体更吃体力）
+STAMINA_EFF_MIN = 0.25          # 体力 0 时的效率；调小 = 低体力时更费
+STAMINA_EFF_GAIN = 1.2          # 效率随体力线性增长（体力 100 时 = MIN+GAIN）
+STAMINA_DEMAND_REF = 250.0      # 250ms 的同键间隔算 1.0 份消耗
+STAMINA_DEMAND_MIN = 0.4        # 间隔很大时的消耗下限（别让空档变成"回血"）
+STAMINA_DEMAND_MAX = 3.0        # 连打时的消耗上限
+# 体力回复：
+#   1) **常态**也会回（每按一下都回一点，不要求手歇着），所以状态是一路稳着走的；
+#   2) **体力越低回得越快**（越虚越容易回血），高体力时反而慢；
+#   3) 手歇得越久回得越多（空档超过 STAMINA_RECOVER_FLOOR 的部分额外算）。
+# 这三条合起来让终盘有一个**稳定收敛点**：体力掉到某个值附近就掉不下去了。
+# 这个点由 BASE / DRAIN_K 的比值决定，实测（`data/_selftest/stamina_calibrate.py`）
+# RC1 19 / RC3 19 / RC4 36 / RC5 60 / HB1 11 / HB3 16 / TB 36，
+# 也就是"需求"= 打完还剩 40% 所需的最低体力值。要整体调难度就成比例动 DRAIN_K。
+STAMINA_RECOVER_BASE = 0.8      # 每次判定的常态回复（体力 100% 时）
+STAMINA_RECOVER_K = 150.0       # 每秒"有效空档"的额外回复
+STAMINA_RECOVER_FLOOR = 400.0   # 小于这个间隔（毫秒）算连续输出，只有常态回复
+STAMINA_LOW_GAIN = 1.2          # 低体力加速：回复量 × (1 + GAIN×(1−体力/100))
 # 长条的"松手判定"：不吃手速（不算同键间隔、也不耗体力），但比点击更容易打偏
 LONG_RELEASE_SIGMA_SCALE = 1.8
-# 体力消耗：越密越费，体力越高越省
-STAMINA_DRAIN_K = 3.0
-STAMINA_EFF_MIN = 0.4
-STAMINA_EFF_GAIN = 1.2
-STAMINA_DEMAND_REF = 250.0
-STAMINA_DEMAND_MIN = 0.4
-STAMINA_DEMAND_MAX = 3.0
-# 体力回复：一只手歇得越久回得越多（只有超过 STAMINA_RECOVER_FLOOR 的空档才算休息）
-STAMINA_RECOVER_K = 120.0       # 每秒空档回复多少体力
-STAMINA_RECOVER_FLOOR = 400.0   # 小于这个间隔（毫秒）算连续输出，不回复
-# 心态崩盘（手抖）：连击够长、并且体力已经吃紧时才会发生。
+# 心态崩盘（手抖）：连击够长、并且**局部压力够高**时才会发生（门槛见 CHOKE_STRAIN_FLOOR，
+# 不再直接看体力 —— 压力自己会和体力挂钩，见 STRAIN_FATIGUE_ABS_FLOOR）。
 # 它不是"凭空漏键"，而是给落点加一个很大的延迟 —— 表现为 BAD 或擦边 MISS，
 # 具体算哪一种取决于判定窗口，改窗口不用改这里。
-CHOKE_COMBO_FLOOR = 500.0   # 连击不到 500 完全不紧张
-CHOKE_COMBO_CAP = 2000.0    # 连击到 2000 才把连击带来的紧张度拉满
-CHOKE_FATIGUE_FLOOR = 0.25  # 疲劳不到这个程度完全不紧张（体力还宽裕就不该手抖）
-CHOKE_PER_NOTE_MAX = 0.025  # 心态 0 + 连击拉满 + 体力见底 + 压力拉满时的崩率
+CHOKE_PER_NOTE_MAX = 0.025  # 心态 0 + 压力拉满时的每音符崩率（再乘局面/分差倍率）
 CHOKE_SCORE_BOOST = 0.5     # 自己分高时的额外倍率
 CHOKE_MATCH_POINT_BOOST = 1.5  # 赛点的额外倍率
 CHOKE_LATENCY = 120.0       # 手抖时落点整体偏晚多少毫秒
 CHOKE_SIGMA = 45.0          # 手抖时的抖动幅度
 SCORE_PRESSURE_REF = 1000000.0  # 分数（0~1000000）到多少算"高分"
+
+# ---------------- 局部压力（strain）：失误概率的来源 ----------------
+# 以前"压力"只有两个开关：连击 >500、疲劳 >0.25 —— 简单谱永远不触发、难谱一触发就是大事故，
+# 中间那一大片"手紧一下、蹦出一个 GREAT"完全没有表达。现在改成**连续的压力场**：
+#
+#     strain = w1·局部密度 + w2·局部疲劳 + w3·局面 + w4·连击        （clamp 0~1）
+#
+# 四个通道都强调"**局部**"：
+#   局部密度     这一段比**这首歌平时**密多少（爆点/连打才涨，平缓段清零）——
+#                注意不是"比自己的能力密多少"：后者对速度够用的人来说恒为 0，压力会消失
+#   局部疲劳     瞬时疲劳 **减掉这首歌到目前的平均疲劳**（只惩罚"比自己平时更累"的时刻，
+#                否则难谱全程都是满值，等于又变成全局开关）
+#   局面         赛点 / 大比分接近 / 本局分差接近 / 歌曲后段 —— 这就是"关键分手紧"
+#   连击         连击越长越怕断（替代原来那个生硬的门槛，但保留一个地板）
+#
+# 它喂给两个出口（见 `_small_miss_offset` / `choke_chance`）：
+#   小失误：概率 = strain × 心态脆性 × P_SMALL_MAX，命中给 +15~35ms → GREAT / 擦边，**不断连**
+#   大失误：概率同源，但要求 strain 更高，命中 +120ms → BAD / 擦边 MISS
+STRAIN_W_DENSITY = 0.22     # 局部密度权重
+STRAIN_W_FATIGUE = 0.18     # 局部疲劳（超基线）权重
+STRAIN_W_SITUATION = 0.15   # 局面权重
+STRAIN_W_COMBO = 0.07       # 连击权重
+# 四个权重之和 = 0.62 ≈ 一切拉满时的 strain 上限；平时各通道都只有零点几，strain 落在 0.1~0.4
+# 局部密度：这一下的同键间隔比"这首歌平时的间隔"紧多少，紧这么多倍算"满"
+STRAIN_BURST_RATIO = 2.2
+STRAIN_BURST_FLOOR = 0.15   # 比平时紧不到这个比例就不算压力（避免整首歌都在轻微贡献）
+STRAIN_GAP_WINDOW = 300.0   # "这首歌平时的间隔"的滑动窗口（音符数）
+# 密度那一路 = 相对爆点 × 这个比例 + 绝对压力 × (1−这个比例)
+STRAIN_BURST_SHARE = 0.45
+# 绝对压力：shortfall = 能力间隔/实际间隔 − 1，越接近能力上限越接近 1
+# （shortfall=0.25 → 0.63、0.5 → 0.86、1.0 → 0.98），所以"离上限很远"时几乎为 0
+STRAIN_ABSOLUTE_SCALE = 0.25
+# 局部疲劳参照的"基线"用指数滑动平均，时间常数越小越贴近瞬时。
+# 只比基线还不够：难谱全程都很累，基线自己也抬到很高，于是"超基线"恒为 0，
+# 压力反而**消失**了（真打到体力见底却没有压力，和"压力该和体力挂钩"正好相反）。
+# 所以再压一个地板：局部疲劳 = max(疲劳 − 基线, STRAIN_FATIGUE_ABS_FLOOR × 疲劳)。
+# 这样体力越低那一份越实，同时"比自己平时更累"的相对那一路仍然有效。
+STRAIN_FATIGUE_EMA = 0.02
+STRAIN_FATIGUE_FULL = 0.35  # 疲劳比基线高出这么多算"满"
+STRAIN_FATIGUE_ABS_FLOOR = 0.5  # 至少把"当前疲劳"的一半算进压力（0 = 退回纯相对）
+STRAIN_SITUATION_SCORE_DELTA = 60000.0  # 两队分差小于这个值时，局面压力最高
+STRAIN_COMBO_FLOOR = 120.0  # 连击不到这个数，连击通道不贡献压力
+STRAIN_COMBO_CAP = 1200.0   # 连击到这个数，连击通道拉满
+
+# 小失误：命中后落点整体打偏多少（正态），所以多半落进 GREAT 而不是漏键
+SMALL_MISS_CHANCE_MAX = 0.08    # strain 与心态脆性都拉满时的每音符概率
+SMALL_MISS_LATENCY = 26.0       # 小失误把落点推后多少毫秒
+SMALL_MISS_SIGMA = 9.0          # 小失误的抖动幅度
+# 大失误（崩盘）额外要求：strain 不到这个程度不掷骰子。
+# 实测各档的 strain 峰值：简单谱 ~0.37、Love! ~0.37、Vacant ~0.41，
+# 所以门槛取 0.33 = "压力接近这场自己的峰值"时才可能手抖。
+CHOKE_STRAIN_FLOOR = 0.33
 
 # ---------------- 计分：照搬 osu!lazer 的 mania 方案 ----------------
 # 源码：osu.Game.Rulesets.Mania/Scoring/ManiaScoreProcessor.cs
@@ -184,6 +265,41 @@ def _combo_multiplier(combo: int) -> float:
         return COMBO_MULT_MIN
     return min(max(COMBO_MULT_MIN, math.log(combo, COMBO_LOG_BASE)),
                math.log(COMBO_MULT_CAP_COUNT, COMBO_LOG_BASE))
+
+
+def stamina_cost_for(tapdist: int, stamina: int) -> float:
+    """这一下的体力消耗（正数）。
+
+        消耗 = STAMINA_DRAIN_K × demand(同键间隔) ÷ 效率(体力)
+
+    - `demand` 只看这一下的同键间隔：越密越费（`STAMINA_DEMAND_REF` / 间隔），
+      并有上下限，免得"一秒空一下"或"20ms 连打"把曲线拉爆；
+    - `效率` 随体力线性上升：**体力越高越省**，体力 0 时只有 `STAMINA_EFF_MIN`。
+      所以体力见底不只是"回得慢"，它还**花得更快**——低体力是个双重惩罚。
+    """
+    demand = min(STAMINA_DEMAND_MAX,
+                 max(STAMINA_DEMAND_MIN, STAMINA_DEMAND_REF / max(tapdist, 25)))
+    efficiency = STAMINA_EFF_MIN + STAMINA_EFF_GAIN * (stamina / 100.0)
+    return STAMINA_DRAIN_K * demand / efficiency
+
+
+def stamina_recover_for(rest: int, current: float) -> float:
+    """这一下的体力回复（正数）。
+
+        recover = BASE × 当前比例^EXP + 空档奖励，两者都随"越低回得越多"放大
+
+    - **常态回复**：每按一下都回 `STAMINA_RECOVER_BASE` 乘一个随体力下降而变大的倍率，
+      所以不需要"手歇着"也在稳着回（设计要求：常态下能稳定恢复）；
+    - **越低回得越快**：倍率 = 1 + `STAMINA_LOW_GAIN` × (1 − 当前比例)。
+      它让终盘有一个**稳定的收敛点**：体力掉到某个值附近，回复自然追平消耗，
+      不会一路掉到 0（也不会像线性回复那样把难度整体抹平）；
+    - **空档奖励**：手真的歇够了（间隔超过 `STAMINA_RECOVER_FLOOR`）再额外回一点，
+      所以有休息段的谱子对体力要求更低 —— 这是"长谱不等于难谱"的来源。
+    """
+    low_gain = 1.0 + STAMINA_LOW_GAIN * max(0.0, 1.0 - current)
+    recover = STAMINA_RECOVER_BASE * low_gain
+    rest_gap = max(0.0, rest - STAMINA_RECOVER_FLOOR)
+    return recover + STAMINA_RECOVER_K * rest_gap / 1000.0 * low_gain
 
 
 def timing_sigma_for(accuracy: float) -> float:
@@ -297,6 +413,23 @@ class Player:
 
         # 赛中状态
         self.match_point: bool = False   # 本局是不是赛点（由比赛在开局时告诉选手）
+        # 局部压力（strain）用的状态：对手这一局打到哪里、当前大比分、这首歌的平均疲劳基线
+        self.opponent_score: float = 0.0
+        self.match_scores: Tuple[int, int] = (0, 0)
+        self.fatigue_baseline: float = 0.0
+        self._last_density_pressure: float = 0.0
+        # 疲劳欠账（见 FATIGUE_DEBT_KEEP）：真的状态在 reset_for_new_song 里重置，
+        # 这里先给个 0，免得构造途中（roll_abilities 之类的间接调用）读到没有的属性
+        self.fatigue_debt: float = 0.0
+        # "这首歌平时"的同键间隔（局部密度/爆点通道的基线）
+        self._gap_baseline: float = 0.0
+        self._last_gap: float = 0.0
+        # 观测用：本局逐音符记录的 strain（求平均/峰值，控制台会打出来）
+        self.strain_sum: float = 0.0
+        self.strain_peak: float = 0.0
+        self.strain_samples: int = 0
+        self.small_miss_count: int = 0
+        self.choke_count: int = 0
 
         self.roll_abilities(form_range)
         self.reset_for_new_song()
@@ -378,65 +511,132 @@ class Player:
         average = sum(self.stamina_left) / (2.0 * INITIAL_STAMINA)
         return max(0.0, min(1.0, 1.0 - average))
 
+    # ------------------------------------------------------------------
+    # 局部压力（strain）
+    # ------------------------------------------------------------------
     @property
-    def display_score(self) -> float:
-        """屏幕上那个"跟着曲目进度走"的分数（0~1000000）。
-
-        **只影响显示，不碰计分**：`score` / `std_score` 仍是 lazer 那套原始分，
-        赛果表、Excel、结算榜、控制台用的都是它。这里只给屏幕换一把尺子。
-
-        原始分是 S 形：前一半几乎不动（Science[Easy] 打到 50% 才 12 万），
-        最后四分之一涨掉一半 —— 因为 lazer 分数里的"准度项"同时带着
-        `准度^(2+2×准度)` 和"判定进度"两个因子，早期两个因子都小。
-
-        显示分改写成"两段混一混"：
-
-            display = 原始分 × 进度 + 原始分 × 进度 × 进度
-                    = 原始分 × 进度 × (1 + 进度)
-
-        第一项 `原始分 × 进度` 是**跟着速度走**的那部分（打得快分数就涨得快），
-        第二项 `原始分 × 进度²` 是"打到后面权重更大"的那部分。两项都是"原始分 × 进度"的
-        倍数，所以：
-
-        - **曲终精确回到原始分**：进度到 1 时 `1 + 进度 = 2` 抵消了系数里的 1/2，
-          显示分 == 原始分 —— 结算画面和打的时候最后一帧一致，不会跳；
-        - **前段不再趴着**：Science[Easy]（准度 70）进度 10/25/50/75/90% 时
-          原始分是 1.0/3.6/12.1/34.2/64.7（万），显示分是 9.1/19.0/28.2/38.0/60.9（万）
-          —— 第 10% 就有 9 万，而不是 1 万；50% 时已经接近 30 万；
-        - **单调不减**：原始分只增，`进度 × (1+进度)` 也只增（两者都非负）；
-        - **区分度提前**：两队分差从第 10% 就看得见，而不是憋到最后四分之一。
-        """
-        if self.score <= 0.0 or self.accuracy_judged <= 0:
+    def song_progress(self) -> float:
+        """这首歌打到哪里了（0~1）。"""
+        if self.total_judgements <= 0:
             return 0.0
-        progress = min(1.0, self.accuracy_judged / self.total_judgements)
-        display = self.score * progress * (1.0 + progress) * 0.5
-        return max(0.0, min(SCORE_MAX_TOTAL, display))
+        return min(1.0, self.accuracy_judged / self.total_judgements)
+
+    @property
+    def situation_pressure(self) -> float:
+        """局面压力（0~1）：赛点、大比分接近、本局分差接近、歌曲后段。
+
+        这就是"关键分手紧"—— 和体力无关的那一份。三个前提里任何一条成立都会抬它：
+        另外两支队伍咬得紧、这是赛点/决胜局、以及歌已经打到后半段。
+        """
+        # 1) 大比分越接近越紧张（0:0 和 1:1 都拉满，2:0 时明显松）
+        if self.match_scores:
+            gap = abs(self.match_scores[0] - self.match_scores[1])
+            score_pressure = max(0.0, 1.0 - gap / 2.0)
+        else:
+            score_pressure = 0.0
+        # 2) 本局两队分差越接近越紧张
+        if self.opponent_score > 0.0 or self.std_score > 0.0:
+            delta = abs(self.std_score - self.opponent_score)
+            close = max(0.0, 1.0 - delta / STRAIN_SITUATION_SCORE_DELTA)
+        else:
+            close = 0.0
+        # 3) 歌曲后段（后半段线性抬起来）
+        late = max(0.0, self.song_progress - 0.5) / 0.5
+        base = 0.45 * score_pressure + 0.55 * close
+        if self.match_point:
+            base = max(base, 1.0)
+        return max(0.0, min(1.0, max(base, base * 0.5 + 0.5 * late)))
+
+    @property
+    def absolute_pressure(self) -> float:
+        """**绝对压力**（0~1）：这一下的间隔离"这个人的能力上限"有多近。
+
+        只用谱面内相对值（爆点 = 比这首歌平时紧多少）有个洞：一张很平缓的谱，
+        对高能力选手来说"处处都是爆点"却都不吃力，压力不该高。所以再加一路绝对值：
+
+            shortfall = 手速决定的间隔 / 这一下的同键间隔 − 1      （≈ 需要比能力再快多少）
+            absolute  = 1 − exp(−shortfall / STRAIN_ABSOLUTE_SCALE)
+
+        **离能力上限越远（还能从容处理得越多）→ 越接近 0**，于是"极少出现小失误"；
+        真的踩在能力线上 → 趋近 1。它和 `burst_pressure`（相对爆点）融合成 strain 的密度通道。
+        """
+        if self._last_gap <= 0.0:
+            return 0.0
+        required_gap = SPEED_GAP_MAX - (SPEED_GAP_MAX - SPEED_GAP_MIN) * (self.speed / 100.0)
+        shortfall = required_gap / max(self._last_gap, 25.0) - 1.0
+        if shortfall <= 0.0:
+            return 0.0
+        return min(1.0, 1.0 - math.exp(-shortfall / max(1e-6, STRAIN_ABSOLUTE_SCALE)))
+
+    @property
+    def strain(self) -> float:
+        """这一瞬间的**局部压力**（0~1）：小失误/大失误的概率都由它出。
+
+        密度那一路 = 相对爆点 × 权重 + 绝对压力 × 权重（见 `burst_pressure` /
+        `absolute_pressure`）：前者保证"这一段比平时紧"算压力，后者保证
+        "**离能力上限很远时几乎不施加压力**"。另外两路是局部疲劳超基线和局面。
+        """
+        density = (STRAIN_BURST_SHARE * min(1.0, self.burst_pressure)
+                   + (1.0 - STRAIN_BURST_SHARE) * self.absolute_pressure)
+        # 局部疲劳 = "比自己平时更累"和"当前真的有多累"取大的那个：
+        # 前者抓爆点，后者保证体力见底时压力跟着上来（见 STRAIN_FATIGUE_ABS_FLOOR）。
+        extra_fatigue = max(self.fatigue - self.fatigue_baseline,
+                            STRAIN_FATIGUE_ABS_FLOOR * self.fatigue)
+        fatigue = min(1.0, max(0.0, extra_fatigue) / STRAIN_FATIGUE_FULL)
+        if self.combo < STRAIN_COMBO_FLOOR:
+            combo = 0.0
+        else:
+            combo = min(1.0, (self.combo - STRAIN_COMBO_FLOOR)
+                        / max(1.0, STRAIN_COMBO_CAP - STRAIN_COMBO_FLOOR))
+        total = (STRAIN_W_DENSITY * density
+                 + STRAIN_W_FATIGUE * fatigue
+                 + STRAIN_W_SITUATION * self.situation_pressure
+                 + STRAIN_W_COMBO * combo)
+        return max(0.0, min(1.0, total))
+
+    @property
+    def burst_pressure(self) -> float:
+        """这一下的"爆点程度"（0~1）：**这一段比这首歌平时紧多少**。
+
+        口径是局部的、和选手能力无关：同一个爆点，对高手和新手都是"这里比平时密"，
+        区别只在于他们各自的 σ 不同。这样"局部压力"才是谱面属性，而不是能力属性的重复计费。
+        """
+        if self._gap_baseline <= 0.0 or self._last_gap <= 0.0:
+            return 0.0
+        ratio = self._gap_baseline / max(1.0, self._last_gap)
+        ratio = max(0.0, ratio - 1.0 - STRAIN_BURST_FLOOR)
+        return min(1.0, ratio / max(1e-6, STRAIN_BURST_RATIO - 1.0 - STRAIN_BURST_FLOOR))
+
+    @property
+    def mentality_fragility(self) -> float:
+        """心态脆性：心态越高越不容易被压力推出手感（1 → 0）。"""
+        return max(0.0, 1.0 - self.mentality / 100.0)
 
     @property
     def choke_chance(self) -> float:
-        """当前这一瞬间"手抖一下"的概率。
+        """这一瞬间"手抖一下"（大失误）的概率。
 
-        三个前提缺一不可：
-        - 连击够长（< CHOKE_COMBO_FLOOR 时完全不紧张）；
-        - **体力已经吃紧** —— 压力大小取"还剩多少体力"的补数，并且设了死区：
-          疲劳不到 CHOKE_FATIGUE_FLOOR 时完全不掷骰子。所以体力宽裕时（低难图几乎不掉体力，
-          或者本人耐力很好）绝不会莫名其妙冒漏键，压力自然集中在长歌的后半段和密谱上；
-        - 心态不是满分（这句话本身就带一个 1 − 心态/100 的系数）。
+        入口是**局部压力 `strain`**（四条通道：局部密度 / 局部疲劳超基线 / 局面 / 连击），
+        不再直接看"体力还剩多少"：
 
-        自己分高、或者进入赛点会再放大一点；计分赛没有赛点，所以那里不会吃到赛点倍率。
+        - `strain` 低于 `CHOKE_STRAIN_FLOOR` 时完全不掷骰子 ——
+          简单谱即使打到后半段，压力也上不去，所以不会莫名崩；
+        - 心态不是满分：`fragility = 1 − 心态/100` 作为放大器（大心脏风格明显抗压）；
+        - 自己分高、进入赛点会再放大一点（这部分和 `situation_pressure` 是两码事：
+          前者放大"崩不崩"，后者本身就是压力源）。计分赛没有赛点，所以吃不到赛点倍率。
         """
-        fragility = 1.0 - self.mentality / 100.0
-        if fragility <= 0.0 or self.combo < CHOKE_COMBO_FLOOR:
+        fragility = self.mentality_fragility
+        if fragility <= 0.0:
             return 0.0
-        combo_progress = min(1.0, (self.combo - CHOKE_COMBO_FLOOR)
-                             / max(1.0, CHOKE_COMBO_CAP - CHOKE_COMBO_FLOOR))
-        strain = max(0.0, self.fatigue - CHOKE_FATIGUE_FLOOR) / (1.0 - CHOKE_FATIGUE_FLOOR)
-        if strain <= 0.0:
+        strain = self.strain
+        if strain <= CHOKE_STRAIN_FLOOR:
             return 0.0
+        # 门槛之上线性放大：刚到门槛时为 0，strain 拉满时为 1
+        above = min(1.0, (strain - CHOKE_STRAIN_FLOOR) / max(1e-6, 1.0 - CHOKE_STRAIN_FLOOR))
         boost = 1.0 + CHOKE_SCORE_BOOST * min(1.0, self.std_score / SCORE_PRESSURE_REF)
         if self.match_point:
             boost += CHOKE_MATCH_POINT_BOOST
-        return CHOKE_PER_NOTE_MAX * fragility * combo_progress * strain * boost
+        return CHOKE_PER_NOTE_MAX * fragility * above * boost
 
     # ------------------------------------------------------------------
     # 重置与计分准备
@@ -456,6 +656,18 @@ class Player:
         self.stamina_left: List[float] = [INITIAL_STAMINA, INITIAL_STAMINA]
         # 两只手各一条"慢漂移"（见 TIMING_DRIFT_SIGMA）：每首歌开头从 0 起漂
         self.drift: List[float] = [0.0, 0.0]
+        # 疲劳欠账（见 FATIGUE_DEBT_KEEP）：整只手的滞后，每首歌从 0 起
+        self.fatigue_debt: float = 0.0
+        # 局部压力的"平均疲劳基线"也每首歌重来（用指数滑动平均在线估计）
+        self.fatigue_baseline = 0.0
+        self._last_density_pressure = 0.0
+        self._gap_baseline = 0.0
+        self._last_gap = 0.0
+        self.strain_sum = 0.0
+        self.strain_peak = 0.0
+        self.strain_samples = 0
+        self.small_miss_count = 0
+        self.choke_count = 0
         # 每个键位上一个"已经结算过的音符时间"，用来算同键间隔（≈ 谱面密度）
         self.last_note_time: List[int] = [INITIAL_TAP_TIME] * TRACK_COUNT
         # 每只手上一次出力的时间，用来算空档（回复体力用）
@@ -538,9 +750,22 @@ class Player:
         self.last_hand_time[hand] = note.time
         self._remove_note(note)
 
+        # 先用"这一下之前"的状态估一次局部压力（小失误/崩盘的概率都由它出），
+        # 再推进密度压力与疲劳基线 —— 顺序很重要：基线要用同一时刻的量去比。
+        self._last_density_pressure = self._density_pressure_for(tapdist)
+        self._last_gap = float(tapdist)
+        strain = self.strain
+        self.strain_sum += strain
+        self.strain_peak = max(self.strain_peak, strain)
+        self.strain_samples += 1
+
         # 先按当前体力状态出手，再结算这一下消耗掉的体力
-        press_offset = self._press_offset(tapdist, hand) + self._choke_offset()
+        press_offset = (self._press_offset(tapdist, hand)
+                        + self._small_miss_offset(strain)
+                        + self._choke_offset(strain))
         self._drain_stamina(hand, tapdist, rest)
+        self._update_fatigue_baseline()
+        self._update_gap_baseline(tapdist)
 
         judgement = self.judge_system.get_judgement(press_offset)
         if judgement == 'miss':
@@ -628,11 +853,11 @@ class Player:
 
         `hand` 用来推进/取用那只手的**慢漂移**（见 `_advance_drift`）——
         每结算一个判定推进一次，所以漂移是"成段"的，不是白噪声。
+
+        密度压力直接复用调用方为了算 `strain` 已经算好的那一份（`_last_density_pressure`），
+        不在两处各算一遍口径不同的东西。
         """
-        required_gap = SPEED_GAP_MAX - (SPEED_GAP_MAX - SPEED_GAP_MIN) * (self.speed / 100.0)
-        # 略微超出能力范围只是"有点吃力"，真的差一大截才会崩：
-        # 压力取平方后，密度刚好卡在能力边缘时惩罚很小，跟不上时惩罚迅速放大
-        density_pressure = max(0.0, required_gap / max(tapdist, 25) - 1.0) ** DENSITY_EXPONENT
+        density_pressure = self._last_density_pressure
         fatigue = self.fatigue
 
         # σ 由准度打底（受压力衰减），密度压力、疲劳各自加上一份；μ 是整体偏晚的部分。
@@ -641,34 +866,112 @@ class Player:
         sigma = self.timing_sigma * damp + density_sigma + fatigue_sigma
 
         mu = DENSITY_LATENCY * density_pressure + FATIGUE_LATENCY * fatigue
-        return self.rng.gauss(mu, sigma) + self._advance_drift(hand)
+        # 「低体力拖慢手」：疲劳越重，落点整体越晚、越散（见 FATIGUE_LATENCY_SCALE）。
+        # 乘在 μ 和 σ 外面而不是只加到 σ 里，是为了让**均值**也被推晚 ——
+        # 否则只是"抖得厉害"，不会表现为"平均点击间隔明显变大"。
+        sluggish = 1.0 + FATIGUE_LATENCY_SCALE * fatigue
+        value = self.rng.gauss(mu * sluggish, sigma * sluggish)
+        # 「滞后累积」：手沉了以后**来不及把上一拍欠下的时间补回来**，欠账会带到下一拍。
+        #
+        # 只把每一拍的落点整体推晚一个固定量是看不出"点击间隔变大"的：所有音符一起后移，
+        # 相邻两下的差仍然是零。真实的手沉是**逐拍累积**的——
+        #     滞后 ← 滞后 × DECAY + 这一拍欠下的时间
+        # 于是连续几拍会一次比一次晚（间隔被拉长），偶尔回过神来再迅速追回（间隔被压缩）。
+        # 因为有 DECAY，它不会无限增长；而且 `stamina` 一高（疲劳低）就没有欠账，
+        # 所以高体力时这套机制完全不动，不影响既有手感。
+        debt = value * FATIGUE_DEBT_SHARE if value > 0.0 else 0.0
+        self.fatigue_debt = (self.fatigue_debt * FATIGUE_DEBT_DECAY
+                             + FATIGUE_DEBT_KEEP * debt)
+        return value + self.fatigue_debt * sluggish + self._advance_drift(hand)
+
+    def _density_pressure_for(self, tapdist: int) -> float:
+        """这一下的密度压力（和 σ/μ 里那一项同一个口径，单独算一次给 strain 用）。"""
+        required_gap = SPEED_GAP_MAX - (SPEED_GAP_MAX - SPEED_GAP_MIN) * (self.speed / 100.0)
+        return max(0.0, required_gap / max(tapdist, 25) - 1.0) ** DENSITY_EXPONENT
+
+    def _update_fatigue_baseline(self) -> None:
+        """在线估计"这首歌到目前的平均疲劳"，供 strain 的"超基线"通道使用。
+
+        用指数滑动平均，所以在开局几百毫秒内就能跟上当前谱面的强度 ——
+        难谱的基线会自己抬到 0.6~0.8，于是"局部疲劳"只在**比平时更累**的时刻才贡献压力。
+        """
+        self.fatigue_baseline = (self.fatigue_baseline * (1.0 - STRAIN_FATIGUE_EMA)
+                                 + self.fatigue * STRAIN_FATIGUE_EMA)
+
+    def _update_gap_baseline(self, tapdist: int) -> None:
+        """在线估计"这首歌平时的同键间隔"，供"局部密度（爆点）"通道使用。
+
+        和疲劳基线同一个思路：爆点压力 = 平时间隔 / 这一下的间隔，所以它是
+        **谱面局部属性**，速度够快的选手在爆点段同样会被判"这里很挤"。
+
+        用"窗口 ≈ 300 个音符"的滑动平均（而不是锚在第一个音符上）：开头锚定的话，
+        基线会被前几个音符带偏，"比平时紧多少"就永远算不出东西来。
+        """
+        # 只统计真实的同键间隔：第一个音符的间隔是"距今好几秒"，不该进基线
+        if tapdist <= 0 or tapdist > 5000:
+            return
+        alpha = 1.0 / STRAIN_GAP_WINDOW
+        if self._gap_baseline <= 0.0:
+            self._gap_baseline = float(tapdist)
+            return
+        self._gap_baseline += (tapdist - self._gap_baseline) * alpha
+
+    def _small_miss_offset(self, strain: float) -> float:
+        """压力下的**小失误**：手紧一下，落点整体偏出去一截（多半是 GREAT，不断连）。
+
+        概率 = strain × 心态脆性 × SMALL_MISS_CHANCE_MAX。
+        它是"有原因"的：压力大（爆点/后段/关键分/长连击）才生效，心态好的人明显少。
+
+        **随机数每次判定都抽**（哪怕这次一定不发生）：否则"这一帧结算了几个音符"会改变
+        随机流的位置，无 UI 模式换帧步长就会算出不同结果（帧步长无关性是本项目的硬约束）。
+        """
+        roll = self.rng.random()
+        offset = self.rng.gauss(SMALL_MISS_LATENCY, SMALL_MISS_SIGMA)
+        chance = strain * self.mentality_fragility * SMALL_MISS_CHANCE_MAX
+        if chance <= 0.0 or roll >= chance:
+            return 0.0
+        self.small_miss_count += 1
+        return offset
+
+    def _choke_offset(self, strain: float) -> float:
+        """心态崩盘（大失误）：不是凭空掉键，而是"手抖一下"——给落点加一个很大的延迟。
+
+        和以前唯一的区别是**触发条件**：不再直接看"连击 + 疲劳"，而是看局部压力
+        `strain`（它里面已经含了局部密度、局部疲劳、局面、连击四条通道）。
+        所以简单谱上即使打到后半段也不会莫名其妙崩，难谱/关键分才真会手抖。
+
+        同样**每次判定都抽随机数**，理由见 `_small_miss_offset`。
+        """
+        roll = self.rng.random()
+        offset = self.rng.gauss(CHOKE_LATENCY, CHOKE_SIGMA)
+        chance = self.choke_chance
+        if chance <= 0.0 or roll >= chance:
+            return 0.0
+        self.choke_count += 1
+        return offset
 
     def _drain_stamina(self, hand: int, tapdist: int, rest: int = 0) -> None:
-        """结算一个音符的体力：越密越费，体力越高越省；这只手歇得久会回一点。
+        """结算一个音符的体力：越密越费、体力越高越省；回复见文件顶部那段说明。
 
         `tapdist` 是同轨间隔（决定这一下有多费），`rest` 是这只手距离上一次出力的
         间隔（决定歇够了没有）—— 两者口径不同：两条轨轮流砸的时候轨间隔可能不小，
-        但手其实一直在动，所以回复只看整只手的空档。
+        但手其实一直在动，所以"歇够"只看整只手的空档。
+
+        回复有三条：
+        1. **常态回复**：每按一下都回 `STAMINA_RECOVER_BASE`（所以是稳态，不会一路掉到底）；
+        2. **空档回复**：超过 `STAMINA_RECOVER_FLOOR` 的部分按 `STAMINA_RECOVER_K`/秒 额外回；
+        3. **越低回得越快**：两条都乘 `1 + STAMINA_LOW_GAIN×(1 − 当前体力比例)`。
         """
-        demand = min(STAMINA_DEMAND_MAX,
-                     max(STAMINA_DEMAND_MIN, STAMINA_DEMAND_REF / max(tapdist, 25)))
-        efficiency = STAMINA_EFF_MIN + STAMINA_EFF_GAIN * (self.stamina / 100.0)
-        cost = STAMINA_DRAIN_K * demand / efficiency
-        recover = STAMINA_RECOVER_K * max(0.0, rest - STAMINA_RECOVER_FLOOR) / 1000.0
+        # 两条公式都在模块级（`stamina_cost_for` / `stamina_recover_for`），
+        # 标定脚本 `data/_selftest/stamina_calibrate.py` 直接调它们，
+        # 所以"模拟里怎么算"和"工具里怎么算"永远是同一份代码，不会各写一遍改漏一处。
+        cost = stamina_cost_for(tapdist, self.stamina)
+        # "越低回得越快"用**这只手当前**的体力比例，所以两只手各按自己的状态回复
+        current = self.stamina_left[hand] / INITIAL_STAMINA
+        recover = stamina_recover_for(rest, current)
+
         self.stamina_left[hand] = min(
             INITIAL_STAMINA, max(0.0, self.stamina_left[hand] - cost + recover))
-
-    def _choke_offset(self) -> float:
-        """心态崩盘：不是凭空掉键，而是"手抖一下"——给落点加一个很大的延迟。
-
-        每个音符只结算一次，所以这里天然只会掷一次骰子。
-        """
-        chance = self.choke_chance
-        if chance <= 0.0:
-            return 0.0
-        if self.rng.random() < chance:
-            return self.rng.gauss(CHOKE_LATENCY, CHOKE_SIGMA)
-        return 0.0
 
     # ------------------------------------------------------------------
     # 结算

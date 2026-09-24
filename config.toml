@@ -18,7 +18,7 @@ screen_width = 1280          # 窗口宽
 screen_height = 720          # 窗口高
 fps = 60                     # 帧率
 max_render_dist = 1200       # 音符提前多少毫秒进入视野（同时决定屏幕上能看到多远）
-debug = false                # true = 在左上角显示当前歌曲时间等调试信息
+debug = true            # true = 在左上角显示当前歌曲时间等调试信息
 
 # --- 无 UI 比赛 ---
 # true = 不弹 pygame 窗口、不渲染、不等真实时间，用虚拟时钟尽快把整场比赛跑完，
@@ -60,7 +60,7 @@ rounds_to_win = 3                 # 先赢几局算赢下比赛（2 = BO3）—�
 resume = true
 # 赛果缓存：每局一个胜者序号（0 = 第一支队，1 = 第二支队），每局打完自动写回这里，
 # 启动时读取。想重新开一场把它清成 [] 即可（或者把 resume 改成 false）。
-results = [0, 0, 1, 1, 1]
+results = [1, 1, 0]
 
 # --- 计分赛模式 ---
 # true = 不管 rounds_to_win，把下面 [[picks]] 里写的曲目按顺序各打一遍，
@@ -68,7 +68,7 @@ results = [0, 0, 1, 1, 1]
 #        结算画面也从"谁赢"换成总分排名榜。
 #        [[songs]] 是曲库（可供选曲的池子），[[picks]] 才是计分赛实际要打的曲目表；
 #        没写 [[picks]] 时会退化成打整个曲库。
-score_mode = false
+score_mode = true
 excel_file = "data/score_match.xlsx"  # 计分赛成绩表写到哪（相对路径基于本文件）
 
 # 常规赛果表：比赛打完（决出胜负）时把每一局双方得分写到这里。
@@ -168,78 +168,39 @@ TB = [200, 200, 200]
 #  音频优先用谱面里 AudioFilename 指定的那个，再退回到 audio.mp3/.ogg/.wav）
 # ===========================================================================
 [[songs]]
-id = "RC1"    
-title = "Trick Heart"
-artist = "MIMI feat. Kasane Teto SV"
-folder = "data/beatmaps/2499321 MIMI feat. Kasane Teto SV - Trick Heart"
-beatmap = "MIMI feat. Kasane Teto SV - Trick Heart (Dereck101026) [Ace of Hearts].osu"
+id = "RC1"                                              # 前两位是上面 pool_colors 里的分类
+title = "Lian Fan Nao Ye Rong Ru Tian Kong"
+artist = "Monster Siren Records"
+folder = "data/beatmaps/2598781"
+# beatmap = "xxx.osu"
+# audio = "audio.mp3"
 
 [[songs]]
-id = "RC2"    
-title = "POSSESSION"
-artist = "TAG underground"
-folder = "data/beatmaps/2563907 TAG underground - POSSESSION"
-beatmap = "TAG underground - POSSESSION (P45ta) [Expert].osu"
+id = "LN1"
+title = "TESHiKANi"
+artist = "wotoha"
+folder = "data/beatmaps/2474010 wotoha - TESHiKANi"
 
 [[songs]]
-id = "RC3"
-title = "Hemisphere"
-artist = "ARForest"
-folder = "data/beatmaps/2582456 ARForest - Hemisphere"
-
-[[songs]]
-id = "RC4"
-folder = "data/beatmaps/2382059 Lime - Pixel Planet"
-title = "Pixel Planet"
-artist = "Lime"
-beatmap = "Lime - Pixel Planet (Wishtynite) [Expert].osu"
-
-[[songs]]
-id = "RC5"
-folder = "data/beatmaps/2263967 ROKINA - Schwerkraft"
-title = " Schwerkraft"
-artist = "ROKINA"
-
-[[songs]]
-id = "HB1"    
-title = "War in the Mirrorworld"
-artist = "Aoi"
-folder = "data/beatmaps/2134993 Aoi - War in the Mirrorworld"
-beatmap = "Aoi - War in the Mirrorworld ([TCD] Vani) [MEGA Lv.12].osu"
-
-[[songs]]
-id = "HB2"    
-title = "Hotaru wa Inakatta"
-artist = "Harumaki Gohan feat. Hatsune Miku"
-folder = "data/beatmaps/2219679 Harumaki Gohan feat. Hatsune Miku - Hotaru wa Inakatta [no video]"
-beatmap = "Harumaki Gohan feat. Hatsune Miku - Hotaru wa Inakatta (c6H8o6_) [Fireflies].osu"
-
-[[songs]]
-id = "HB3"
-folder = "data/beatmaps/2325733 Ave Mujica - KiLLKiSS (TV Size)"
-title = "KiLLKiSS (TV Size)"
-artist = "Ave Mujica"
-beatmap = "Ave Mujica - KiLLKiSS (TV Size) (ML-ysg) [killkiss].osu"
-
-[[songs]]
-id = "TB"
-folder = "data/beatmaps/755101 AA... Hisui Chazuke... - Stardust Prism"
-title = "Stardust Prism"
-artist = "AA... Hisui Chazuke..."
+id = "HB1"
+title = "Ultimate Force"
+artist = "Sakuzyo"
+folder = "data/beatmaps/2318291 Sakuzyo - Ultimate Force (Game Ver.)"
+beatmap = "Sakuzyo - Ultimate Force (Game Ver.) ([TCD] Ena-suki) [TOTAL DESTRUCTION TILL THE WORLD'S END].osu"
 
 # ===========================================================================
 #  队伍与玩家：必须是 2 支队伍，每队 1~3 名玩家（名字直接写在这里）
 #  玩家能力值由名字哈希生成，换个名字就是换个人
 # ===========================================================================
 [[teams]]
-name = "Stellarina-Aria"
+name = "Purple Phantom"
 color = [255, 100, 90]
-players = ["Tamiko","Hoshi","Kotone"]
+players = ["Purple","Purlos","Purcy"]
 
 [[teams]]
-name = "Pasta"
+name = "Maximum Male Models"
 color = [0, 150, 255]
-players = ["Salt","Veneto","Nill"]
+players = ["Mansoor","Mace","McKennie"]
 
 
 # ===========================================================================
@@ -248,15 +209,10 @@ players = ["Salt","Veneto","Nill"]
 #  team 填 0/1 指定这一轮由哪队选歌，不填就按轮次自动轮换（0,1,0,1...）
 #  全部用完之后会自动在曲库里循环
 # ===========================================================================
-# 曲库现在正好是这四首 RC，picks 也按同样顺序排满：第 1 局 RC1、第 2 局 RC2、第 3 局 RC3、第 4 局 RC4。
-# 注意当前 rounds_to_win = 1（BO1），普通模式下只打得到第 1 局；要四首都打一遍请把 score_mode 打开
+
 [[picks]]
-song = "RC4"
+song = "RC1"
 [[picks]]
-song = "RC5"
+song = "LN1"
 [[picks]]
-song = "HB3"
-[[picks]]
-song = "RC3"
-[[picks]]
-song = "TB"
+song = "HB1"
